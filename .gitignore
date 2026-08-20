@@ -1,0 +1,21 @@
+# Project-local tools and build output
+.tools/
+.work/
+bin/
+/codex-remote-host
+
+# Runtime state
+.codex-remote/
+/state/
+/state.db
+/state.db-*
+/audit/
+*.db
+*.db-shm
+*.db-wal
+*.sock
+*.socket
+*.log
+
+# OS metadata
+.DS_Store

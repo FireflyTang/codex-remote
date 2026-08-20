@@ -1,0 +1,42 @@
+# Host / Gateway implementation status
+
+## Scope and fixed choices
+
+- Official network entry is an embedded `tsnet.Server` plain TCP listener at `:80`; no host listener, system `tailscaled`, TLS/WSS, Serve, Funnel, Headscale, relay, or fallback.
+- SQLite stores Remote Codex metadata, restart snapshots, persistent event heads, and side-effect request deduplication.
+- Replay is available only for events retained by the current Host run. Gateway compares the paired `after_host_run_id`: a different run forces `RESET + CurrentView`, while ActivityStore only reasons about cursor availability and never guesses run identity from sequence numbers.
+- Audit is diagnostic ProtoJSON JSONL: C/S decoded plus raw wire, app-server raw wire, canonical activity, Host/RPC/runtime/Tailnet evidence, correlation IDs, basic rotation and tar.gz export. It does not implement hash chains or per-record forced fsync.
+
+## Implemented
+
+- `internal/tailnet`: stable hostname/state directory, optional auth key, interactive auth URL callback, Start/WaitReady, Tailnet-only `Server.Listen`, LocalClient/WhoIs, status, connection/lifecycle evidence, and Close.
+- `internal/persistence`: SQLite schema and API for source-scoped `(session_source, session_id)` Codex mapping/current view, monotonic event heads, resolved-pending tombstones, and request dedup. The original global thread-ID uniqueness is migrated to source-scoped identity. `IN_PROGRESS` requests survive restart and are explicitly not replayed.
+- `internal/activity`: persistent event allocation/current view, authoritative unknown-Codex rejection, bounded same-run replay, live watch queues, reset reasons including Host restart. Canonical audit is diagnostic: a failed audit write marks degradation but does not suppress a persisted replay/live business event.
+- `internal/audit`: append-only ProtoJSON JSONL, raw hashes/truncation, decoded frames, canonical/app-server/runtime helpers, degraded state, size rotation, and diagnostic export. Inbound C/S request records and best-effort app-server turn IDs are linked to canonical activities through record IDs; this remains diagnostic correlation rather than a compliance chain. If audit storage cannot initialize, Host uses an explicitly degraded recorder, logs the failure, and continues serving rather than claiming evidence or blocking business traffic.
+- `internal/gateway`: strict ProtoJSON codec, exact V1.0 Hello, all 13 RPC routes (11 backend plus connection-scoped Watch/Unwatch), concurrent response correlation, persistent side-effect dedup, shared request-ID/deadline validation, RPC audit, application Ping/Pong/Close, frame limits, bounded send/watch queues, and slow-consumer close. Cursor replay requires `after_host_run_id`; a missing paired run ID is invalid and a different run ID forces `RESET/HOST_RESTARTED`. Rewatch atomically invalidates the old watch so no old buffered event can appear after the new Watch Response; Watch Response/replay is queued before live delivery.
+- `internal/codex`: directory/session/Codex/history/turn/approval/user-input backend; all eight canonical event families; structured user/agent/reasoning/plan/command/file-change/tool items; semantic text/command deltas; terminal turn status, failure, provenance, and timestamp conversion; request correlation; and persistent CurrentView/registry state. Session discovery and import use normalized source-scoped identity, while opaque page tokens are bound to the operation and normalized query/CWD.
+- Approval and user-input responses verify that the adapter pending request belongs to the requested Codex thread. Resolved user input retains its questions and authoritative selected option IDs/free-form answers. Pending RPCs from an earlier app-server process are cleared on restore with explicit warning/completeness because their response channel is not recoverable; a newly re-emitted runtime pending request remains actionable.
+- Large vendor content and multi-item CurrentView/History collections are bounded from half the configured formal C/S frame budget, leaving envelope headroom, and propagate explicit `Completeness`. History is marked incomplete rather than emitting an oversized frame. State transitions propagate persistence/publish failures instead of returning false success, and adapter-event failures degrade Host status.
+- Live plan/diff notifications that omit `itemId` use stable per-turn synthetic identities (`<turn>:plan` / `<turn>:diff`), so repeated updates upsert rather than collide or append duplicates. Start-turn state commits and adapter event commits are serialized end-to-end; a plan/item/pending notification arriving before the `turn/start` response is merged into the running view instead of being overwritten by a stale clone.
+- Canonical Event and RESET budgeting covers collection-heavy plan steps, file changes, user messages, approval commands/explanations, user-input questions/options, and vendor warnings. CurrentView budgeting never drops the active-turn identity or actionable pending identities; under pressure it retains typed item skeletons and the minimum request/question/option/decision fields needed to respond, with explicit Completeness and a diagnostic budget warning when space permits.
+- Live canonical events carry the protocol-level `Event.completeness` whenever their payload is clipped, including Warning, Approval, and UserInput events that lack a suitable nested item marker. User-input clipping preserves every question ID and option ID, a non-empty option label, and the multiple-selection contract; descriptions/prompts remain presentation-only clipping candidates.
+- Large repeated fields use batch transformation plus binary-search prefix sizing rather than delete-and-marshal loops. A 6000-argument approval therefore performs O(n log n) total serialization work instead of O(n²), keeping the state commit lane available for the following pending request. Plan steps, file changes, history turns, turn items, warning metadata, and Codex warnings use the same bounded-complexity approach where applicable.
+- `internal/capability` retains the frozen baseline while incorporating previously unknown session source kinds actually observed from app-server discovery.
+- Activity watch overflow has an explicit slow-consumer signal. Gateway uses a priority control lane so `Close=SLOW_CONSUMER` is delivered before the WebSocket close even when the normal send queue is full.
+- Inbound and outbound formal frames are checked against the advertised hard limit. On overflow Gateway best-effort sends application `Close=FRAME_TOO_LARGE` before WebSocket 1009. The Codex owner budgets whole collections below that limit; Gateway is the final hard-limit fallback.
+- `cmd/codex-remote-host`: complete runtime/adapter/session/directory/persistence/activity/audit/gateway/tailnet composition. The production default only obtains its listener from embedded tsnet and runs WhoIs before upgrade.
+- A strict loopback-only `--dev-listen` seam exists for external black-box testing. It is explicit, logs a warning, and is never selected as a production fallback. External fake app-server configuration is exposed through executable/argument/socket flags.
+
+Tests passed:
+
+```text
+.tools/go/bin/go test ./cmd/codex-remote-host ./internal/...
+.tools/go/bin/go test -race ./internal/codex ./internal/persistence ./internal/capability
+bash scripts/blackbox.sh
+```
+
+The black-box script passed its normal, interrupt, approval, structured user-input, large-output, burst/slow-consumer, and Host restart scenarios, including real WebSocket/ProtoJSON traffic through the launched Host and external deterministic fake app-server. Restart checks confirm stable Host/Codex identity and history, a new `host_run_id`, and mandatory `RESET/HOST_RESTARTED` based on the paired run ID.
+
+## Acceptance result
+
+Repository-wide check, race, vet, launched-Host black-box scenarios, restart phases and independent read-only audit/remediation are complete. No blocking finding remains for the confirmed Demo milestone; the untested live-Tailnet and real-Codex boundaries are recorded in `docs/development_status.md`.

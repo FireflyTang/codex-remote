@@ -1,0 +1,6 @@
+version: v2
+plugins:
+  - local: ../.tools/bin/protoc-gen-go
+    out: gen/go
+    opt:
+      - paths=source_relative

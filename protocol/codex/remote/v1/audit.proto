@@ -1,0 +1,115 @@
+syntax = "proto3";
+
+package codex.remote.v1;
+
+import "codex/remote/v1/common.proto";
+import "codex/remote/v1/event.proto";
+import "codex/remote/v1/transport.proto";
+
+option go_package = "github.com/kylin1993/codex-remote/protocol/gen/go/codex/remote/v1;remotev1";
+
+// AuditRecord is encoded as one ProtoJSON object per JSONL line.
+message AuditRecord {
+  uint32 format_version = 1;
+  string record_id = 2;
+  uint64 local_seq = 3;
+  int64 observed_at_unix_ms = 4;
+
+  AuditSide side = 5;
+  string process_run_id = 6;
+  AuditKind kind = 7;
+  AuditDirection direction = 8;
+  AuditOutcome outcome = 9;
+
+  string component = 10;
+  string operation = 11;
+  string message = 12;
+
+  string connection_id = 20;
+  string client_id = 21;
+  string client_run_id = 22;
+  string request_id = 23;
+  string codex_id = 24;
+  uint64 event_seq = 25;
+  string thread_id = 26;
+  string turn_id = 27;
+  string item_id = 28;
+
+  string parent_record_id = 30;
+  uint64 duration_ms = 31;
+  Error error = 32;
+
+  // Present for decoded C/S wire frames.
+  Frame frame = 40;
+
+  // Exact UTF-8 wire text. For invalid frames, this may be truncated.
+  string raw_text = 41;
+  string raw_sha256 = 42;
+  uint64 raw_size_bytes = 43;
+  bool raw_truncated = 44;
+
+  map<string, string> metadata = 50;
+  Provenance provenance = 51;
+  CanonicalActivity canonical_activity = 52;
+  Completeness completeness = 53;
+}
+
+message Provenance {
+  ProvenanceKind kind = 1;
+  repeated string source_record_ids = 2;
+  string source_session_id = 3;
+  string source_method = 4;
+  string source_version = 5;
+  int64 observed_at_unix_ms = 6;
+  Completeness completeness = 7;
+}
+
+message CanonicalActivity {
+  string activity_id = 1;
+  string codex_id = 2;
+  string thread_id = 3;
+  string turn_id = 4;
+  string item_id = 5;
+  int64 occurred_at_unix_ms = 6;
+  Event event = 7;
+  Provenance provenance = 8;
+  map<string, string> vendor_data = 9;
+  Completeness completeness = 10;
+}
+
+enum AuditSide {
+  AUDIT_SIDE_UNSPECIFIED = 0;
+  AUDIT_SIDE_CLIENT = 1;
+  AUDIT_SIDE_HOST = 2;
+}
+
+enum AuditKind {
+  AUDIT_KIND_UNSPECIFIED = 0;
+  AUDIT_KIND_PROCESS_LIFECYCLE = 1;
+  AUDIT_KIND_CONNECTION_LIFECYCLE = 2;
+  AUDIT_KIND_UI_ACTION = 3;
+  AUDIT_KIND_CS_WIRE_FRAME = 4;
+  AUDIT_KIND_RPC = 5;
+  AUDIT_KIND_CLIENT_STATE_APPLY = 6;
+  AUDIT_KIND_CANONICAL_ACTIVITY = 7;
+  AUDIT_KIND_APP_SERVER_WIRE = 8;
+  AUDIT_KIND_HOST_ACTION = 9;
+  AUDIT_KIND_RUNTIME_LOG = 10;
+  AUDIT_KIND_APPLICATION_LOG = 11;
+}
+
+enum AuditDirection {
+  AUDIT_DIRECTION_UNSPECIFIED = 0;
+  AUDIT_DIRECTION_INBOUND = 1;
+  AUDIT_DIRECTION_OUTBOUND = 2;
+  AUDIT_DIRECTION_INTERNAL = 3;
+}
+
+enum AuditOutcome {
+  AUDIT_OUTCOME_UNSPECIFIED = 0;
+  AUDIT_OUTCOME_STARTED = 1;
+  AUDIT_OUTCOME_SUCCEEDED = 2;
+  AUDIT_OUTCOME_FAILED = 3;
+  AUDIT_OUTCOME_DROPPED = 4;
+  AUDIT_OUTCOME_IGNORED = 5;
+}

@@ -1,0 +1,251 @@
+syntax = "proto3";
+
+package codex.remote.v1;
+
+import "codex/remote/v1/common.proto";
+
+option go_package = "github.com/kylin1993/codex-remote/protocol/gen/go/codex/remote/v1;remotev1";
+
+message HostInfo {
+  string host_id = 1;
+  string name = 2;
+  HostStatus status = 3;
+  string host_version = 4;
+  RuntimeInfo runtime = 5;
+  int64 started_at_unix_ms = 6;
+}
+
+message RuntimeInfo {
+  RuntimeStatus status = 1;
+  string codex_version = 2;
+  string app_server_version = 3;
+  int64 started_at_unix_ms = 4;
+  uint64 restart_count = 5;
+}
+
+message Capabilities {
+  repeated string feature_ids = 1;
+  repeated string models = 2;
+  repeated string modes = 3;
+  repeated string approval_policies = 4;
+  repeated string session_source_kinds = 5;
+  uint32 max_watches_per_connection = 6;
+  uint32 max_page_size = 7;
+}
+
+message DirectoryEntry {
+  string name = 1;
+  string path = 2;
+}
+
+message SessionCandidate {
+  string session_id = 1;
+  string cwd = 2;
+  string title = 3;
+  string preview = 4;
+  string source = 5;
+  int64 created_at_unix_ms = 6;
+  int64 updated_at_unix_ms = 7;
+  SessionAvailability availability = 8;
+  string managed_codex_id = 9;
+  repeated Warning warnings = 10;
+  Completeness completeness = 11;
+}
+
+message Codex {
+  string codex_id = 1;
+  string thread_id = 2;
+  string cwd = 3;
+  string title = 4;
+  CodexOrigin origin = 5;
+  CodexStatus status = 6;
+  string active_turn_id = 7;
+  int64 created_at_unix_ms = 8;
+  int64 imported_at_unix_ms = 9;
+  int64 last_activity_at_unix_ms = 10;
+  repeated Warning warnings = 11;
+}
+
+message Warning {
+  WarningCode code = 1;
+  string message = 2;
+  map<string, string> metadata = 3;
+}
+
+message UserInputPart {
+  oneof content {
+    TextInput text = 1;
+  }
+}
+
+message TextInput {
+  string text = 1;
+}
+
+message TurnOptions {
+  string model = 1;
+  // Codex collaboration mode (for example "default" or "plan"). This is
+  // independent from reasoning_effort and must not be forwarded as effort.
+  string mode = 2;
+  string approval_policy = 3;
+  string reasoning_effort = 4;
+}
+
+message TurnSnapshot {
+  string turn_id = 1;
+  TurnStatus status = 2;
+  int64 started_at_unix_ms = 3;
+  int64 completed_at_unix_ms = 4;
+  repeated Item items = 5;
+  Error failure = 6;
+  Completeness completeness = 7;
+  ProvenanceKind provenance = 8;
+}
+
+message Item {
+  string item_id = 1;
+  string turn_id = 2;
+  ItemStatus status = 3;
+
+  oneof content {
+    UserMessageItem user_message = 10;
+    AgentMessageItem agent_message = 11;
+    ReasoningSummaryItem reasoning_summary = 12;
+    PlanItem plan = 13;
+    CommandItem command = 14;
+    ToolItem tool = 15;
+    FileChangeItem file_change = 16;
+  }
+  Completeness completeness = 20;
+  ProvenanceKind provenance = 21;
+}
+
+message UserMessageItem {
+  repeated UserInputPart input = 1;
+}
+
+message AgentMessageItem {
+  string text = 1;
+}
+
+message ReasoningSummaryItem {
+  string text = 1;
+}
+
+message PlanItem {
+  repeated PlanStep steps = 1;
+}
+
+message PlanStep {
+  string text = 1;
+  string status = 2;
+}
+
+message CommandItem {
+  repeated string argv = 1;
+  string cwd = 2;
+  string output = 3;
+  int32 exit_code = 4;
+  bool has_exit_code = 5;
+  reserved 6;
+}
+
+message ToolItem {
+  string tool_name = 1;
+  string summary = 2;
+  string result_summary = 3;
+}
+
+message FileChangeItem {
+  repeated FileChange changes = 1;
+  string unified_diff = 2;
+  reserved 3;
+}
+
+message FileChange {
+  string path = 1;
+  FileChangeKind kind = 2;
+  string old_path = 3;
+  string new_path = 4;
+}
+
+enum FileChangeKind {
+  FILE_CHANGE_KIND_UNSPECIFIED = 0;
+  FILE_CHANGE_KIND_ADDED = 1;
+  FILE_CHANGE_KIND_MODIFIED = 2;
+  FILE_CHANGE_KIND_DELETED = 3;
+  FILE_CHANGE_KIND_RENAMED = 4;
+}
+
+message Approval {
+  string approval_id = 1;
+  string turn_id = 2;
+  string item_id = 3;
+  string kind = 4;
+  ApprovalStatus status = 5;
+  string title = 6;
+  string explanation = 7;
+  repeated string command = 8;
+  repeated ApprovalDecision allowed_decisions = 9;
+  int64 created_at_unix_ms = 10;
+  int64 resolved_at_unix_ms = 11;
+  ApprovalDecision resolved_decision = 12;
+}
+
+message UserInputRequestState {
+  string user_input_request_id = 1;
+  string turn_id = 2;
+  string item_id = 3;
+  reserved 4;
+  bool resolved = 5;
+  int64 created_at_unix_ms = 6;
+  int64 resolved_at_unix_ms = 7;
+  repeated UserInputQuestion questions = 8;
+  repeated UserInputAnswer resolved_answers = 9;
+  Completeness completeness = 10;
+}
+
+message UserInputQuestion {
+  string question_id = 1;
+  string header = 2;
+  string prompt = 3;
+  repeated UserInputOption options = 4;
+  bool allows_multiple = 5;
+  bool allows_free_form = 6;
+}
+
+message UserInputOption {
+  string option_id = 1;
+  string label = 2;
+  string description = 3;
+}
+
+message UserInputAnswer {
+  string question_id = 1;
+  repeated string selected_option_ids = 2;
+  string free_form_text = 3;
+}
+
+message PendingRequest {
+  oneof request {
+    Approval approval = 1;
+    UserInputRequestState user_input = 2;
+  }
+}
+
+message CurrentView {
+  Codex codex = 1;
+  TurnSnapshot active_turn = 2;
+  repeated PendingRequest pending_requests = 3;
+  uint64 head_event_seq = 4;
+  int64 generated_at_unix_ms = 5;
+  Completeness completeness = 6;
+}
+
+message HistoryPage {
+  string codex_id = 1;
+  repeated TurnSnapshot turns = 2;
+  PageInfo page = 3;
+  bool history_complete = 4;
+  Completeness completeness = 5;
+}
