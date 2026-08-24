@@ -30,13 +30,14 @@ type message struct {
 }
 
 type fixture struct {
-	mu        sync.Mutex
-	threads   map[string]map[string]any
-	pending   map[string]func()
-	scenario  string
-	stateFile string
-	next      int
-	disrupted bool
+	mu                sync.Mutex
+	threads           map[string]map[string]any
+	pending           map[string]func()
+	historyReadErrors map[string]string
+	scenario          string
+	stateFile         string
+	next              int
+	disrupted         bool
 }
 
 func main() {
@@ -57,7 +58,7 @@ func main() {
 		log.Fatal(err)
 	}
 	defer ln.Close()
-	f := &fixture{threads: map[string]map[string]any{}, pending: map[string]func(){}, scenario: *scenario, stateFile: *stateFile}
+	f := &fixture{threads: map[string]map[string]any{}, pending: map[string]func(){}, historyReadErrors: map[string]string{}, scenario: *scenario, stateFile: *stateFile}
 	if err := f.load(); err != nil {
 		log.Fatal(err)
 	}
@@ -154,20 +155,35 @@ func (f *fixture) handle(req message, write func(any)) {
 		id := fmt.Sprintf("fake-thread-%03d", f.next)
 		thread := map[string]any{"id": id, "sessionId": id, "cwd": p.CWD, "preview": "deterministic fake session", "createdAt": time.Now().Unix(), "updatedAt": time.Now().Unix(), "source": "appServer", "status": "idle", "turns": []any{}}
 		f.threads[id] = thread
+		if f.scenario == "unmaterialized-history" {
+			switch f.next {
+			case 1:
+				f.historyReadErrors[id] = "thread " + id + " is not materialized yet; includeTurns is unavailable before first user message"
+			case 2:
+				f.historyReadErrors[id] = "thread history rejected for a different deterministic reason"
+			}
+		}
 		_ = f.persistLocked()
 		f.mu.Unlock()
 		respond(map[string]any{"thread": thread})
 		write(map[string]any{"jsonrpc": "2.0", "method": "thread/started", "params": map[string]any{"threadId": id, "thread": thread}})
 	case "thread/read", "thread/resume":
 		var p struct {
-			ThreadID string `json:"threadId"`
+			ThreadID     string `json:"threadId"`
+			IncludeTurns bool   `json:"includeTurns"`
 		}
 		_ = json.Unmarshal(req.Params, &p)
 		f.mu.Lock()
 		thread := f.threads[p.ThreadID]
+		historyReadError := f.historyReadErrors[p.ThreadID]
+		turns, _ := thread["turns"].([]any)
 		f.mu.Unlock()
 		if thread == nil {
 			write(map[string]any{"jsonrpc": "2.0", "id": req.ID, "error": map[string]any{"code": -32004, "message": "thread not found"}})
+			return
+		}
+		if req.Method == "thread/read" && p.IncludeTurns && len(turns) == 0 && historyReadError != "" {
+			write(map[string]any{"jsonrpc": "2.0", "id": req.ID, "error": map[string]any{"code": -32600, "message": historyReadError}})
 			return
 		}
 		respond(map[string]any{"thread": thread})

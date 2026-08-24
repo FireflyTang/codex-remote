@@ -98,7 +98,7 @@ stop_host() {
 }
 
 result=0
-scenario_list="${CODEX_REMOTE_BLACKBOX_SCENARIOS:-normal interrupt approval user-input sessions structured failed rewatch synthetic-upsert early-large large multi-large burst audit-failure runtime-disconnect}"
+scenario_list="${CODEX_REMOTE_BLACKBOX_SCENARIOS:-normal interrupt approval user-input sessions unmaterialized-history structured failed rewatch synthetic-upsert early-large large multi-large burst audit-failure runtime-disconnect}"
 for scenario in ${scenario_list}; do
   start_host "${scenario}"
   run_pattern='.'
@@ -110,6 +110,8 @@ for scenario in ${scenario_list}; do
     run_pattern='^TestSlowConsumerGetsExplicitProtocolClose$'
   elif [[ "${scenario}" == "sessions" ]]; then
     run_pattern='^Test(DiscoverImportAndContinueUnmanagedSession|PageTokensAreBoundToOperationAndNormalizedQuery)$'
+  elif [[ "${scenario}" == "unmaterialized-history" ]]; then
+    run_pattern='^TestUnmaterializedCreatedThreadHasEmptyHistoryUntilFirstUserMessage$'
   elif [[ "${scenario}" == "structured" ]]; then
     run_pattern='^TestStructuredItemsDeltasAndHistory$'
   elif [[ "${scenario}" == "failed" ]]; then

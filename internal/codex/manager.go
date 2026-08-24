@@ -354,17 +354,20 @@ func (m *Manager) ListHistory(ctx context.Context, req *remotev1.ListHistoryRequ
 	if err != nil {
 		return nil, err
 	}
+	start, limit, err := page(req.Page, m.MaxPage, "history", req.CodexId)
+	if err != nil {
+		return nil, rpcErr(remotev1.ErrorCode_ERROR_CODE_INVALID_REQUEST, err)
+	}
 	ad, err := m.Runtime.Adapter()
 	if err != nil {
 		return nil, rpcErr(remotev1.ErrorCode_ERROR_CODE_RUNTIME_UNAVAILABLE, err)
 	}
 	thread, err := ad.ReadThread(ctx, c.ThreadId, true)
 	if err != nil {
+		if m.normalizeUnmaterializedHistory(c, err) {
+			return &remotev1.ListHistoryResponse{History: &remotev1.HistoryPage{CodexId: req.CodexId, Page: &remotev1.PageInfo{}, HistoryComplete: true}}, nil
+		}
 		return nil, err
-	}
-	start, limit, err := page(req.Page, m.MaxPage, "history", req.CodexId)
-	if err != nil {
-		return nil, rpcErr(remotev1.ErrorCode_ERROR_CODE_INVALID_REQUEST, err)
 	}
 	end := min(start+limit, len(thread.Turns))
 	if start > len(thread.Turns) {
@@ -564,6 +567,19 @@ func (m *Manager) lookup(id string) (*remotev1.Codex, error) {
 		return nil, rpcErr(remotev1.ErrorCode_ERROR_CODE_CODEX_NOT_FOUND, errors.New("codex not found"))
 	}
 	return proto.Clone(v.Codex).(*remotev1.Codex), nil
+}
+
+const unmaterializedIncludeTurnsSuffix = " is not materialized yet; includeTurns is unavailable before first user message"
+
+func (m *Manager) normalizeUnmaterializedHistory(c *remotev1.Codex, err error) bool {
+	if c == nil || c.Origin != remotev1.CodexOrigin_CODEX_ORIGIN_REMOTE_CREATED {
+		return false
+	}
+	var rpc *adapter.RPCError
+	if !errors.As(err, &rpc) || rpc.Code != -32600 || rpc.Message != "thread "+c.ThreadId+unmaterializedIncludeTurnsSuffix {
+		return false
+	}
+	return true
 }
 func (m *Manager) persistView(ctx context.Context, id string, v *remotev1.CurrentView) error {
 	raw, err := protojson.Marshal(v)

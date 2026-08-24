@@ -3,6 +3,7 @@ package codex
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/kylin1993/codex-remote/internal/activity"
 	"github.com/kylin1993/codex-remote/internal/adapter"
+	"github.com/kylin1993/codex-remote/internal/gateway"
 	"github.com/kylin1993/codex-remote/internal/persistence"
 	remotev1 "github.com/kylin1993/codex-remote/protocol/gen/go/codex/remote/v1"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -50,6 +52,71 @@ func TestSetRunningPersistsRegistryAndCorrelation(t *testing.T) {
 	defer w.Cancel()
 	if len(w.Replay) != 2 || w.Replay[0].CausedByRequestId != "request-1" || w.Replay[1].GetCodexUpdated() == nil {
 		t.Fatalf("events %+v", w.Replay)
+	}
+}
+
+func TestNormalizeUnmaterializedHistoryIsNarrowlyScoped(t *testing.T) {
+	m := testManager(t)
+	c := m.byID["c"].Codex
+	matching := &adapter.RPCError{Code: -32600, Message: "thread " + c.ThreadId + unmaterializedIncludeTurnsSuffix}
+	if !m.normalizeUnmaterializedHistory(c, matching) {
+		t.Fatal("managed remote-created thread before its first turn was not normalized")
+	}
+
+	tests := []struct {
+		name  string
+		codex *remotev1.Codex
+		err   error
+	}{
+		{name: "different invalid request", codex: c, err: &adapter.RPCError{Code: -32600, Message: "invalid includeTurns option"}},
+		{name: "different code", codex: c, err: &adapter.RPCError{Code: -32601, Message: matching.Message}},
+		{name: "different thread", codex: c, err: &adapter.RPCError{Code: -32600, Message: "thread other" + unmaterializedIncludeTurnsSuffix}},
+		{name: "unstructured error", codex: c, err: errors.New(matching.Message)},
+		{name: "imported thread", codex: &remotev1.Codex{CodexId: c.CodexId, ThreadId: c.ThreadId, Origin: remotev1.CodexOrigin_CODEX_ORIGIN_LOCAL_EXISTING}, err: matching},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if m.normalizeUnmaterializedHistory(tt.codex, tt.err) {
+				t.Fatal("unexpected empty-history normalization")
+			}
+		})
+	}
+}
+
+func TestNormalizeUnmaterializedHistorySurvivesManagerRebuild(t *testing.T) {
+	c := &remotev1.Codex{CodexId: "c", ThreadId: "thread", Origin: remotev1.CodexOrigin_CODEX_ORIGIN_REMOTE_CREATED}
+	err := &adapter.RPCError{Code: -32600, Message: "thread " + c.ThreadId + unmaterializedIncludeTurnsSuffix}
+	rebuilt := &Manager{}
+	if !rebuilt.normalizeUnmaterializedHistory(c, err) {
+		t.Fatal("rebuilt Manager did not preserve remote-created unmaterialized history semantics")
+	}
+	imported := proto.Clone(c).(*remotev1.Codex)
+	imported.Origin = remotev1.CodexOrigin_CODEX_ORIGIN_LOCAL_EXISTING
+	if rebuilt.normalizeUnmaterializedHistory(imported, err) {
+		t.Fatal("rebuilt Manager normalized an imported existing thread")
+	}
+}
+
+func TestListHistoryValidatesPageTokenBeforeUnmaterializedRead(t *testing.T) {
+	m := testManager(t)
+	// Runtime is intentionally nil: invalid pagination must return before any
+	// thread/read attempt, including the unmaterialized-thread normalization.
+	tests := []struct {
+		name  string
+		token string
+	}{
+		{name: "malformed", token: "not-a-page-token"},
+		{name: "different codex", token: encodePageToken(pageToken{Operation: "history", Query: "other", Offset: 1})},
+		{name: "different RPC", token: encodePageToken(pageToken{Operation: "codexes", Query: "c", Offset: 1})},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := m.ListHistory(context.Background(), &remotev1.ListHistoryRequest{CodexId: "c", Page: &remotev1.PageRequest{PageToken: tt.token}})
+			var rpc *gateway.RPCError
+			if !errors.As(err, &rpc) || rpc.Detail.GetCode() != remotev1.ErrorCode_ERROR_CODE_INVALID_REQUEST {
+				t.Fatalf("ListHistory error=%v, want INVALID_REQUEST", err)
+			}
+		})
 	}
 }
 
