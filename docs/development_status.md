@@ -4,8 +4,8 @@ Last updated: 2026-08-24 (Asia/Shanghai)
 
 ## Milestone status and scope
 
-- Status: the Linux Host personal Demo now implements the V1.1 management lifecycle and bounded workspace access locally. Final integration acceptance for the expanded workspace scope is left to the primary agent; this document does not claim a Host release or live deployment.
-- Acceptance: one complete self-contained launched-Host formal-wire black-box run passed on 2026-08-24 for the pre-workspace lifecycle/restart scope. It used isolated loopback test Hosts and did not restart or exercise a live Tailnet Host. A dedicated workspace formal-wire scenario is now present but is not retroactively included in that earlier evidence.
+- Status: the Linux Host personal Demo implements the V1.1 management lifecycle and bounded workspace access, with expanded integration acceptance complete.
+- Acceptance: one complete self-contained launched-Host formal-wire `bash scripts/blackbox.sh` run exited 0 on 2026-08-24 after workspace integration. The live Tailnet Host was also restarted with a build from commit `5f6aee2`; `/healthz` returned 200 and a real wire smoke confirmed protocol 1.1, the advertised workspace limits, and an allowed initial workspace state.
 - Scope authority: `docs/decision_baseline.md`.
 - Product boundary: embedded `tailscale.com/tsnet`, Tailnet-only plain WebSocket + ProtoJSON, Host-only repository. The client, production security/compliance/high-throughput work, WSS, and host-network/public fallback remain out of scope.
 
@@ -102,15 +102,15 @@ TestWrongPathDoesNotUpgrade
 
 ## Final validation evidence
 
-Pre-workspace lifecycle/restart evidence from 2026-08-24:
+Current V1.1 lifecycle/workspace evidence from 2026-08-24:
 
 ```bash
 make check
 bash scripts/blackbox.sh
-# one complete self-contained run passed, including lifecycle and restart phases
+# one complete self-contained run exited 0, including workspace, lifecycle, and restart phases
 ```
 
-The black-box command launches disposable loopback test Hosts and fake app-server processes. It does not demonstrate that an already-running live Tailnet Host was restarted or upgraded. The workspace scenario was added after the complete run cited above; final expanded-scope integration evidence must come from a new run rather than from this historical result.
+The black-box command launches disposable loopback test Hosts and fake app-server processes. Separately, the live Tailnet Host was restarted from commit `5f6aee2`; `/healthz` returned 200. A real ProtoJSON wire smoke observed exact protocol 1.1, `Capabilities.workspace` limits `524288/2097152/2097152/33554432/1000`, and GetWorkspace with `generation=1` and mutation status `ALLOWED`.
 
 The commands below are historical milestone evidence from 2026-08-17. The first `make check` predates extraction of the authoritative schema and generated artifacts into the public protocol repository; current Host builds do not generate protocol code locally.
 
@@ -136,11 +136,11 @@ The installed Codex CLI 0.147.0 also passed the opt-in read-only smoke for real 
 
 ## Independent audit result
 
-Independent read-only reviews found protocol/run-cursor, source-scoped session, replay atomicity, lost-update, bounded-event, structured-item and external-test gaps during the earlier milestone. The owners fixed those findings and the external black-box owner independently reproduced the corrected lifecycle behavior. Final audit and expanded full-black-box acceptance for workspace remain with the primary agent.
+Independent read-only reviews found protocol/run-cursor, source-scoped session, replay atomicity, lost-update, bounded-event, structured-item and external-test gaps during development. The owners fixed those findings, and the complete expanded lifecycle/workspace black-box run passed.
 
 ## Honest limits and deferred validation
 
-- No live Tailscale control-plane login, `WhoIs`, or remote peer data-plane E2E was performed. Production wiring is implemented and unit-tested; the launched-Host black-box suite intentionally uses the explicit loopback development seam.
+- The live Tailnet evidence is a narrow Host restart, health check, and read-only protocol/workspace wire smoke. Full remote-peer mutation flows and invasive real-Codex workspace writes were not exercised there; the comprehensive deterministic suite continues to use the explicit loopback development seam.
 - Real Codex CLI coverage is read-only smoke only. The deterministic fake drives turn, approval, user-input, failure and restart behavior without touching a user's real session.
 - Active turns and pending app-server RPC channels are not recovered across a Host process restart. Planned restart is allowed only when there is no active turn; stale pending state is cleared and disclosed as incomplete rather than pretending it is actionable.
 - Persisted identity is source-scoped, but real-time upstream notifications carry only `threadId`. If two sources expose the same `threadId`, live notification routing cannot be unambiguously source-scoped without upstream support.
@@ -154,4 +154,4 @@ Independent read-only reviews found protocol/run-cursor, source-scoped session, 
 ## Blockers and remaining work
 
 - Blockers: none for the confirmed Demo milestone.
-- Optional follow-up: run the documented live-Tailnet/real-peer and more invasive real-Codex acceptance checks only when credentials, peers and disposable sessions are intentionally provided.
+- Optional follow-up: run more invasive live-Tailnet/real-peer and real-Codex workspace mutation checks only when credentials, peers, and disposable sessions are intentionally provided.

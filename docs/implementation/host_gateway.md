@@ -38,8 +38,10 @@ Validation commands:
 bash scripts/blackbox.sh
 ```
 
-One complete `bash scripts/blackbox.sh` run passed on 2026-08-24 for the pre-workspace lifecycle scope, covering management lease warning/expiry, manual and automatic unmanage, foreground renewal, same-Codex restoration, and restart persistence of deadlines/unmanaged state/warning deduplication. The new workspace formal-wire scenario must be included in a fresh final integration run. All such script runs use disposable loopback test Hosts; no live Tailnet Host restart or release is claimed here.
+One complete `bash scripts/blackbox.sh` run exited 0 on 2026-08-24 after workspace integration. It covered the six workspace RPCs and ninth Event family alongside management lease warning/expiry, manual and automatic unmanage, foreground renewal, same-Codex restoration, and restart persistence of deadlines/unmanaged state/warning deduplication. The script uses disposable loopback test Hosts.
+
+The live Tailnet Host was restarted on 2026-08-24 with a build from commit `5f6aee2`; `/healthz` returned 200. A real wire smoke confirmed exact protocol 1.1, workspace capability limits `524288/2097152/2097152/33554432/1000`, and GetWorkspace generation 1 with mutation allowed.
 
 ## Acceptance result
 
-The earlier lifecycle milestone completed repository-wide check, race, vet, launched-Host black-box scenarios, restart phases, and independent read-only audit/remediation. Final expanded-scope acceptance for workspace is owned by the primary agent; the untested live-Tailnet and real-Codex boundaries remain recorded in `docs/development_status.md`.
+Repository-wide check, race, vet, the expanded launched-Host black-box scenarios, restart phases, and remediation are complete. The remaining invasive live-Tailnet and real-Codex mutation boundaries are recorded in `docs/development_status.md`.
