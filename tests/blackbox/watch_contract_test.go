@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
+	remotev1 "github.com/FireflyTang/codex-remote-protocol/gen/go/codex/remote/v1"
 	"github.com/coder/websocket"
-	remotev1 "github.com/kylin1993/codex-remote/protocol/gen/go/codex/remote/v1"
 )
 
 func TestWatchValidatesCodexRequestIDAndDeadline(t *testing.T) {

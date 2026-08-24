@@ -19,7 +19,7 @@ make tools
 make test
 ```
 
-Protocol linting, generation, and the full project checks are available through `make check`.
+Run the full Host checks with `make check`. Protocol generation is not part of this repository's build.
 
 ## First start
 
@@ -43,4 +43,4 @@ ws://codex-remote-<linux-hostname>/connect
 
 Both devices must be on the same Tailnet. Traffic is plain WebSocket inside that private network; there is no LAN, public-network, WSS, Serve, or Funnel fallback.
 
-Protocol sources are in [`protocol/codex/remote/v1`](protocol/codex/remote/v1), with committed generated Go code in [`protocol/gen/go/codex/remote/v1`](protocol/gen/go/codex/remote/v1). See [development status and known limits](docs/development_status.md#honest-limits-and-deferred-validation) for current boundaries.
+The authoritative language-neutral schema and generated Go artifact are published by [codex-remote-protocol](https://github.com/FireflyTang/codex-remote-protocol). This Host currently consumes `v1.0.0`; [`protocol.lock`](protocol.lock) records the exact source commit and descriptor hash. See [development status and known limits](docs/development_status.md#honest-limits-and-deferred-validation) for current boundaries.

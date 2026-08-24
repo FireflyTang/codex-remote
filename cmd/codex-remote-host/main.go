@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	remotev1 "github.com/FireflyTang/codex-remote-protocol/gen/go/codex/remote/v1"
 	"github.com/kylin1993/codex-remote/internal/activity"
 	"github.com/kylin1993/codex-remote/internal/adapter"
 	"github.com/kylin1993/codex-remote/internal/audit"
@@ -24,7 +25,6 @@ import (
 	"github.com/kylin1993/codex-remote/internal/persistence"
 	"github.com/kylin1993/codex-remote/internal/runtime"
 	"github.com/kylin1993/codex-remote/internal/tailnet"
-	remotev1 "github.com/kylin1993/codex-remote/protocol/gen/go/codex/remote/v1"
 )
 
 const version = "0.1.0"

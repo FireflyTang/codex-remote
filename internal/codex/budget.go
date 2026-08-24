@@ -1,7 +1,7 @@
 package codex
 
 import (
-	remotev1 "github.com/kylin1993/codex-remote/protocol/gen/go/codex/remote/v1"
+	remotev1 "github.com/FireflyTang/codex-remote-protocol/gen/go/codex/remote/v1"
 )
 
 func (m *Manager) eventPayloadBudget() int {

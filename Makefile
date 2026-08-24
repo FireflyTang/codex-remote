@@ -1,21 +1,15 @@
 SHELL := /bin/bash
 
 TOOLS_DIR := $(CURDIR)/.tools
-BIN_DIR := $(TOOLS_DIR)/bin
 GO_VERSION := 1.26.5
 GO_ARCHIVE := go$(GO_VERSION).linux-amd64.tar.gz
 GO_SHA256 := 5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053
 GO_ROOT := $(TOOLS_DIR)/go
 GO := $(GO_ROOT)/bin/go
-BUF_VERSION := 1.47.2
-BUF_SHA256 := 3a0c4da8d46eea8136affa63db202c76a44f8112384160b73c3fffb1cf14b5d8
-BUF := $(BIN_DIR)/buf
-PROTOC_GEN_GO_VERSION := 1.36.11
-PROTOC_GEN_GO := $(BIN_DIR)/protoc-gen-go
 
-.PHONY: tools proto-lint proto-compile proto-generate generate test check clean-tools
+.PHONY: tools protocol-check test check clean-tools
 
-tools: $(GO) $(BUF) $(PROTOC_GEN_GO)
+tools: $(GO)
 
 $(GO):
 	@mkdir -p $(TOOLS_DIR)
@@ -24,31 +18,33 @@ $(GO):
 	tar -C $(TOOLS_DIR) -xzf $(TOOLS_DIR)/$(GO_ARCHIVE)
 	rm $(TOOLS_DIR)/$(GO_ARCHIVE)
 
-$(BUF):
-	@mkdir -p $(BIN_DIR)
-	curl -fL --retry 3 -o $(BUF) https://github.com/bufbuild/buf/releases/download/v$(BUF_VERSION)/buf-Linux-x86_64
-	@printf '%s  %s\n' '$(BUF_SHA256)' '$(BUF)' | sha256sum --check
-	chmod +x $(BUF)
-
-$(PROTOC_GEN_GO): $(GO) Makefile
-	@mkdir -p $(BIN_DIR)
-	GOBIN=$(BIN_DIR) $(GO) install google.golang.org/protobuf/cmd/protoc-gen-go@v$(PROTOC_GEN_GO_VERSION)
-
-proto-lint: $(BUF)
-	cd protocol && $(BUF) lint
-
-proto-compile: $(BUF)
-	cd protocol && $(BUF) build
-
-proto-generate: $(BUF) $(PROTOC_GEN_GO)
-	cd protocol && $(BUF) generate
-
-generate: proto-generate
+protocol-check: $(GO)
+	@set -eu; \
+	lock_value() { awk -F'"' -v key="$$1" '$$2 == key { print $$4; exit }' protocol.lock; }; \
+	module=$$(lock_value module); \
+	version=$$(lock_value version); \
+	repository=$$(lock_value repository); \
+	commit=$$(lock_value commit); \
+	descriptor_path=$$(lock_value path); \
+	descriptor_sha=$$(lock_value sha256); \
+	actual_version=$$($(GO) list -m -f '{{.Version}}' "$$module"); \
+	test "$$actual_version" = "$$version" || { echo "protocol module version $$actual_version does not match lock $$version" >&2; exit 1; }; \
+	download=$$($(GO) mod download -json "$$module@$$version"); \
+	origin_url=$$(printf '%s\n' "$$download" | awk -F'"' '$$2 == "URL" { print $$4; exit }'); \
+	origin_hash=$$(printf '%s\n' "$$download" | awk -F'"' '$$2 == "Hash" { print $$4; exit }'); \
+	origin_ref=$$(printf '%s\n' "$$download" | awk -F'"' '$$2 == "Ref" { print $$4; exit }'); \
+	test "$$origin_hash" = "$$commit" || { echo "protocol module origin commit $$origin_hash does not match lock $$commit" >&2; exit 1; }; \
+	test "$$origin_ref" = "refs/tags/$$version" || { echo "protocol module origin ref $$origin_ref does not match expected tag refs/tags/$$version" >&2; exit 1; }; \
+	test "$${origin_url%.git}" = "$${repository%.git}" || { echo "protocol module origin repository $$origin_url does not match lock $$repository" >&2; exit 1; }; \
+	module_dir=$$($(GO) list -m -f '{{.Dir}}' "$$module"); \
+	test -f "$$module_dir/$$descriptor_path" || { echo "protocol descriptor missing: $$module_dir/$$descriptor_path" >&2; exit 1; }; \
+	actual_sha=$$(sha256sum "$$module_dir/$$descriptor_path" | awk '{ print $$1 }'); \
+	test "$$actual_sha" = "$$descriptor_sha" || { echo "protocol descriptor SHA256 $$actual_sha does not match lock $$descriptor_sha" >&2; exit 1; }
 
 test: $(GO)
 	$(GO) test ./...
 
-check: proto-lint proto-compile proto-generate test
+check: protocol-check test
 
 clean-tools:
 	rm -rf $(TOOLS_DIR)

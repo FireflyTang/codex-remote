@@ -3,7 +3,7 @@ package blackbox_test
 import (
 	"testing"
 
-	remotev1 "github.com/kylin1993/codex-remote/protocol/gen/go/codex/remote/v1"
+	remotev1 "github.com/FireflyTang/codex-remote-protocol/gen/go/codex/remote/v1"
 )
 
 // This table is a compile-time guard that every frozen V1 RPC has a

@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"strings"
 
+	remotev1 "github.com/FireflyTang/codex-remote-protocol/gen/go/codex/remote/v1"
 	"github.com/kylin1993/codex-remote/internal/adapter"
-	remotev1 "github.com/kylin1993/codex-remote/protocol/gen/go/codex/remote/v1"
 )
 
 func normalizeSource(raw json.RawMessage) string {

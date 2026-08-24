@@ -24,9 +24,9 @@ The shared-worktree agents did not commit, push, or intentionally revert another
 ## Stable interfaces and dependencies
 
 - Module: `github.com/kylin1993/codex-remote`.
-- Generated protocol import: `github.com/kylin1993/codex-remote/protocol/gen/go/codex/remote/v1`.
+- Protocol dependency: [codex-remote-protocol](https://github.com/FireflyTang/codex-remote-protocol) `v1.0.0`; Go import `github.com/FireflyTang/codex-remote-protocol/gen/go/codex/remote/v1`. The exact source commit and descriptor hash are recorded in the Host root [`protocol.lock`](../protocol.lock).
 - Direct dependencies: `tailscale.com v1.98.10`, `github.com/coder/websocket v1.8.15`, `modernc.org/sqlite v1.38.2`, `google.golang.org/protobuf v1.36.11`.
-- Project-local toolchain: Go 1.26.5, Buf 1.47.2, protoc-gen-go 1.36.11 under ignored `.tools/`; no system configuration was changed.
+- Host project-local toolchain: Go 1.26.5 under ignored `.tools/`; no system configuration was changed. Buf 1.47.2 and protoc-gen-go 1.36.11 were used during the historical in-repository protocol milestone, before schema ownership moved to the public protocol repository.
 - Production endpoint: embedded `tsnet.Server.Listen("tcp", ":80")`, exposed only as `ws://<tsnet-node>/connect` inside the Tailnet.
 
 ## Delivered functionality
@@ -91,7 +91,7 @@ TestWrongPathDoesNotUpgrade
 
 ## Final validation evidence
 
-All commands below passed on 2026-08-17 with the repository-local toolchain:
+The commands below are historical milestone evidence from 2026-08-17. The first `make check` predates extraction of the authoritative schema and generated artifacts into the public protocol repository; current Host builds do not generate protocol code locally.
 
 ```bash
 make check

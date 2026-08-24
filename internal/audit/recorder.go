@@ -19,8 +19,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	remotev1 "github.com/FireflyTang/codex-remote-protocol/gen/go/codex/remote/v1"
 	"github.com/kylin1993/codex-remote/internal/tailnet"
-	remotev1 "github.com/kylin1993/codex-remote/protocol/gen/go/codex/remote/v1"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 )

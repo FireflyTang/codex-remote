@@ -1,6 +1,6 @@
 # Protocol V1.0 frozen decisions
 
-- Package: `codex.remote.v1`; Go import: `github.com/kylin1993/codex-remote/protocol/gen/go/codex/remote/v1`.
+- Package: `codex.remote.v1`; Go import: `github.com/FireflyTang/codex-remote-protocol/gen/go/codex/remote/v1` from [codex-remote-protocol](https://github.com/FireflyTang/codex-remote-protocol) `v1.0.0`. The exact source commit and descriptor hash are pinned in the Host root [`protocol.lock`](../protocol.lock).
 - Transport: one ProtoJSON `Frame` per UTF-8 WebSocket text message, subprotocol `codex-remote.v1.protojson`.
 - Endpoint: embedded `tsnet.Server.Listen("tcp", ":80")` at Tailnet-only `ws://<tsnet-node>/connect`; no WSS, `ListenTLS`, Serve, Funnel, host-network or public fallback.
 - Version: accept exactly `{major:1, minor:0}`. Any other version closes with `CLOSE_CODE_PROTOCOL_VERSION_UNSUPPORTED`.
@@ -14,7 +14,7 @@
 - Runtime restart: planned restart is allowed only without an active turn. V1 does not hot-recover an active turn or blindly replay `IN_PROGRESS`/unknown-result side effects.
 - Audit: human-readable diagnostic evidence, not a compliance or tamper-proof log; no hash chain or per-record forced fsync requirement.
 
-Generated code must only be changed through `.proto` plus `make proto-generate`.
+The authoritative `.proto` files and generated artifacts are changed and released together in the public protocol repository. The Host consumes the pinned release and does not regenerate protocol code locally.
 
 ## Deterministic behavior required by implementations
 

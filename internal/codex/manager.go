@@ -17,6 +17,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	remotev1 "github.com/FireflyTang/codex-remote-protocol/gen/go/codex/remote/v1"
 	"github.com/kylin1993/codex-remote/internal/activity"
 	"github.com/kylin1993/codex-remote/internal/adapter"
 	"github.com/kylin1993/codex-remote/internal/capability"
@@ -25,7 +26,6 @@ import (
 	"github.com/kylin1993/codex-remote/internal/persistence"
 	"github.com/kylin1993/codex-remote/internal/runtime"
 	"github.com/kylin1993/codex-remote/internal/session"
-	remotev1 "github.com/kylin1993/codex-remote/protocol/gen/go/codex/remote/v1"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 )
