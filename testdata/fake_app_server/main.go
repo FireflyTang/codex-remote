@@ -222,6 +222,9 @@ func (f *fixture) emitTurn(write func(any), threadID, turnID string) {
 	}
 	write(map[string]any{"jsonrpc": "2.0", "method": "thread/status/changed", "params": map[string]any{"threadId": threadID, "status": "active"}})
 	write(map[string]any{"jsonrpc": "2.0", "method": "turn/started", "params": map[string]any{"threadId": threadID, "turn": map[string]any{"id": turnID, "status": "inProgress"}}})
+	if f.scenario == "restart" && f.setAutomaticThreadName(threadID) {
+		write(map[string]any{"jsonrpc": "2.0", "method": "thread/name/updated", "params": map[string]any{"threadId": threadID, "threadName": "Automatic title from first user message"}})
+	}
 	if f.scenario == "synthetic-upsert" {
 		f.emitSyntheticPlanDiff(write, threadID, turnID, false)
 		return
@@ -315,6 +318,22 @@ func (f *fixture) updateTurn(threadID, turnID, status string) {
 	}
 	thread["turns"] = append(turns, map[string]any{"id": turnID, "status": status, "startedAt": time.Now().Unix(), "itemsView": "full", "items": f.historyItems()})
 	_ = f.persistLocked()
+}
+
+func (f *fixture) setAutomaticThreadName(threadID string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	thread := f.threads[threadID]
+	if thread == nil {
+		return false
+	}
+	if _, alreadyNamed := thread["name"]; alreadyNamed {
+		return false
+	}
+	thread["name"] = "Automatic title from first user message"
+	thread["updatedAt"] = time.Now().Unix()
+	_ = f.persistLocked()
+	return true
 }
 
 func (f *fixture) load() error {

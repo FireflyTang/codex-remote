@@ -98,6 +98,7 @@ func (m *Manager) Restore(ctx context.Context) error {
 			return fmt.Errorf("resume managed thread %s: %w", r.ThreadID, err)
 		}
 		c := codexFromRecord(r)
+		reconcileRestoredThreadTitle(c, thread)
 		view := &remotev1.CurrentView{Codex: c, GeneratedAtUnixMs: time.Now().UnixMilli()}
 		m.noteUnrecoverablePending(ctx, r.CodexID, view)
 		if len(thread.Turns) > 0 {
@@ -692,7 +693,7 @@ func (m *Manager) applyAdapterEvent(ctx context.Context, e adapter.Event) error 
 	ev := &remotev1.Event{CodexId: id, OccurredAtUnixMs: now}
 	switch e.Kind {
 	case adapter.EventCodexUpdated:
-		applyCodexParams(view.Codex, e.Params)
+		applyCodexParams(view.Codex, e.Method, e.Params)
 		view.Codex.LastActivityAtUnixMs = now
 		ev.Event = &remotev1.Event_CodexUpdated{CodexUpdated: &remotev1.CodexUpdated{Codex: proto.Clone(view.Codex).(*remotev1.Codex)}}
 	case adapter.EventTurnUpdated:
@@ -895,8 +896,20 @@ func resolvedUserInputState(p adapter.PendingRequest, answers []*remotev1.UserIn
 func canonicalOptionID(index int, label string) string {
 	return fmt.Sprintf("option-%d-%s", index+1, base64.RawURLEncoding.EncodeToString([]byte(label)))
 }
-func applyCodexParams(c *remotev1.Codex, raw []byte) {
+func applyCodexParams(c *remotev1.Codex, method string, raw []byte) {
 	body := rawObject(raw)
+	if method == "thread/name/updated" {
+		name, present := body["threadName"]
+		if !present {
+			return
+		}
+		if name == nil {
+			c.Title = ""
+		} else if value, ok := name.(string); ok {
+			c.Title = value
+		}
+		return
+	}
 	if thread, ok := body["thread"].(map[string]any); ok {
 		body = thread
 	}
@@ -916,6 +929,12 @@ func applyCodexParams(c *remotev1.Codex, raw []byte) {
 		}
 	case "error", "failed":
 		c.Status = remotev1.CodexStatus_CODEX_STATUS_ERROR
+	}
+}
+
+func reconcileRestoredThreadTitle(c *remotev1.Codex, thread adapter.Thread) {
+	if c != nil && thread.Name != nil {
+		c.Title = *thread.Name
 	}
 }
 func warningMessage(raw []byte) string {

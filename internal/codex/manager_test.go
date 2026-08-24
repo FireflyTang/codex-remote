@@ -172,6 +172,142 @@ func TestCodexAndWarningCanonicalEvents(t *testing.T) {
 	}
 }
 
+func TestThreadNameUpdatedPersistsAndPublishesCodexTitle(t *testing.T) {
+	m := testManager(t)
+	ctx := context.Background()
+	event := adapter.Event{Kind: adapter.EventCodexUpdated, Method: "thread/name/updated", ThreadID: "thread", Params: json.RawMessage(`{"threadId":"thread","threadName":"Automatic title"}`)}
+	if err := m.applyAdapterEvent(ctx, event); err != nil {
+		t.Fatal(err)
+	}
+
+	m.mu.RLock()
+	view := proto.Clone(m.byID["c"]).(*remotev1.CurrentView)
+	m.mu.RUnlock()
+	if view.Codex.Title != "Automatic title" {
+		t.Fatalf("CurrentView title=%q", view.Codex.Title)
+	}
+	record, err := m.Persistence.GetCodex(ctx, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Title != "Automatic title" {
+		t.Fatalf("persisted title=%q", record.Title)
+	}
+	after := uint64(0)
+	w, err := m.Events.Watch(ctx, "c", &after, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Cancel()
+	if len(w.Replay) != 1 || w.Replay[0].GetCodexUpdated().GetCodex().GetTitle() != "Automatic title" {
+		t.Fatalf("CodexUpdated replay=%+v", w.Replay)
+	}
+}
+
+func TestThreadNameUpdatedDistinguishesNullMissingAndCompatibilityFields(t *testing.T) {
+	c := &remotev1.Codex{Title: "original"}
+	applyCodexParams(c, "thread/name/updated", json.RawMessage(`{"threadId":"thread"}`))
+	if c.Title != "original" {
+		t.Fatalf("missing threadName changed title to %q", c.Title)
+	}
+	applyCodexParams(c, "thread/name/updated", json.RawMessage(`{"threadId":"thread","threadName":""}`))
+	if c.Title != "" {
+		t.Fatalf("empty threadName did not clear title: %q", c.Title)
+	}
+	c.Title = "before null"
+	applyCodexParams(c, "thread/name/updated", json.RawMessage(`{"threadId":"thread","threadName":null}`))
+	if c.Title != "" {
+		t.Fatalf("null threadName did not clear title: %q", c.Title)
+	}
+	applyCodexParams(c, "thread/status/changed", json.RawMessage(`{"thread":{"name":"nested title","status":{"type":"idle"}}}`))
+	if c.Title != "nested title" || c.Status != remotev1.CodexStatus_CODEX_STATUS_IDLE {
+		t.Fatalf("nested compatibility mapping=%+v", c)
+	}
+	applyCodexParams(c, "thread/started", json.RawMessage(`{"title":"legacy title"}`))
+	if c.Title != "legacy title" {
+		t.Fatalf("legacy title mapping=%+v", c)
+	}
+}
+
+func TestRestoreThreadNameReconciliationPreservesNilAndAppliesEmpty(t *testing.T) {
+	m := testManager(t)
+	ctx := context.Background()
+	c := proto.Clone(m.byID["c"].Codex).(*remotev1.Codex)
+	c.Title = "database title"
+	if err := m.persistState(ctx, &remotev1.CurrentView{Codex: c}); err != nil {
+		t.Fatal(err)
+	}
+	reconcileRestoredThreadTitle(c, adapter.Thread{})
+	if c.Title != "database title" {
+		t.Fatalf("nil app-server name erased title: %q", c.Title)
+	}
+	if err := m.persistState(ctx, &remotev1.CurrentView{Codex: c}); err != nil {
+		t.Fatal(err)
+	}
+	record, err := m.Persistence.GetCodex(ctx, "c")
+	if err != nil || record.Title != "database title" {
+		t.Fatalf("nil name persistence title=%q err=%v", record.Title, err)
+	}
+	empty := ""
+	reconcileRestoredThreadTitle(c, adapter.Thread{Name: &empty})
+	if c.Title != "" {
+		t.Fatalf("explicit empty app-server name not reconciled: %q", c.Title)
+	}
+	if err := m.persistState(ctx, &remotev1.CurrentView{Codex: c}); err != nil {
+		t.Fatal(err)
+	}
+	record, err = m.Persistence.GetCodex(ctx, "c")
+	if err != nil || record.Title != "" {
+		t.Fatalf("empty name persistence title=%q err=%v", record.Title, err)
+	}
+	name := "app-server title"
+	reconcileRestoredThreadTitle(c, adapter.Thread{Name: &name})
+	if c.Title != name {
+		t.Fatalf("app-server name not reconciled: %q", c.Title)
+	}
+	view := &remotev1.CurrentView{Codex: c}
+	if err := m.persistState(ctx, view); err != nil {
+		t.Fatal(err)
+	}
+	record, err = m.Persistence.GetCodex(ctx, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Title != name {
+		t.Fatalf("reconciled restore title was not persisted: %q", record.Title)
+	}
+}
+
+func TestThreadNameUpdatedForUnknownThreadDoesNotCrossWrite(t *testing.T) {
+	m := testManager(t)
+	ctx := context.Background()
+	if err := m.applyAdapterEvent(ctx, adapter.Event{Kind: adapter.EventCodexUpdated, Method: "thread/name/updated", ThreadID: "unknown", Params: json.RawMessage(`{"threadId":"unknown","threadName":"wrong"}`)}); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.RLock()
+	title := m.byID["c"].Codex.Title
+	m.mu.RUnlock()
+	if title != "" {
+		t.Fatalf("unknown thread changed managed title to %q", title)
+	}
+	record, err := m.Persistence.GetCodex(ctx, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Title != "" {
+		t.Fatalf("unknown thread persisted title %q", record.Title)
+	}
+	after := uint64(0)
+	w, err := m.Events.Watch(ctx, "c", &after, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Cancel()
+	if len(w.Replay) != 0 {
+		t.Fatalf("unknown thread published events %+v", w.Replay)
+	}
+}
+
 func TestResolvedPendingTombstoneState(t *testing.T) {
 	m := testManager(t)
 	m.byID["c"].PendingRequests = []*remotev1.PendingRequest{{Request: &remotev1.PendingRequest_Approval{Approval: &remotev1.Approval{ApprovalId: "a", Status: remotev1.ApprovalStatus_APPROVAL_STATUS_PENDING}}}}
