@@ -68,6 +68,69 @@ func TestCodexAndEventHeadPersist(t *testing.T) {
 	}
 }
 
+func TestLifecycleColumnsPersistAcrossReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	ctx := context.Background()
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := CodexRecord{CodexID: "c", ThreadID: "t", CWD: "/tmp", Origin: "remote", Status: "idle", ManagementState: "MANAGEMENT_STATE_EXPIRING_SOON", ManagedUntilUnixMS: 1234, WarningDeadlineUnixMS: 1234, CreatedAtUnixMS: 1, LastActivityAtUnixMS: 1}
+	if err = s.UpsertCodex(ctx, record); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	got, err := s.GetCodex(ctx, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ManagementState != record.ManagementState || got.ManagedUntilUnixMS != 1234 || got.WarningDeadlineUnixMS != 1234 {
+		t.Fatalf("lifecycle record=%+v", got)
+	}
+}
+
+func TestLifecycleMigrationPreservesV10CodexAsUnspecified(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`CREATE TABLE codexes (
+ codex_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, session_source TEXT NOT NULL DEFAULT 'unknown', cwd TEXT NOT NULL,
+ title TEXT NOT NULL, origin TEXT NOT NULL, status TEXT NOT NULL,
+ active_turn_id TEXT NOT NULL DEFAULT '', runtime_version TEXT NOT NULL DEFAULT '',
+ created_at_ms INTEGER NOT NULL, imported_at_ms INTEGER NOT NULL DEFAULT 0,
+ last_activity_at_ms INTEGER NOT NULL, current_view_json BLOB,
+ UNIQUE(session_source, thread_id));
+ INSERT INTO codexes(codex_id,thread_id,cwd,title,origin,status,created_at_ms,last_activity_at_ms)
+ VALUES('legacy','thread','/tmp','legacy title','remote','idle',1,1);`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	record, err := s.GetCodex(context.Background(), "legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Title != "legacy title" || record.ManagementState != "" || record.ManagedUntilUnixMS != 0 || record.WarningDeadlineUnixMS != 0 {
+		t.Fatalf("migrated legacy record=%+v", record)
+	}
+}
+
 func TestCommitEventPersistsHeadAndViewAtomicallyAcrossReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
 	ctx := context.Background()

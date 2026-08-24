@@ -132,11 +132,11 @@ func (c *wireClient) hello(t *testing.T) *remotev1.ServerHello {
 	t.Helper()
 	c.writeFrame(t, &remotev1.Frame{Payload: &remotev1.Frame_ClientHello{ClientHello: &remotev1.ClientHello{
 		ClientId: "blackbox-client", ClientRunId: fmt.Sprintf("run-%d", time.Now().UnixNano()),
-		ProtocolVersion: &remotev1.ProtocolVersion{Major: 1, Minor: 0}, ClientName: "blackbox", ClientVersion: "test",
+		ProtocolVersion: &remotev1.ProtocolVersion{Major: 1, Minor: 1}, ClientName: "blackbox", ClientVersion: "test",
 	}}})
 	hello := c.readUntil(t, func(f *remotev1.Frame) bool { return f.GetServerHello() != nil }).GetServerHello()
-	if hello.ProtocolVersion == nil || hello.ProtocolVersion.Major != 1 || hello.ProtocolVersion.Minor != 0 {
-		t.Fatalf("server protocol=%v, want 1.0", hello.ProtocolVersion)
+	if hello.ProtocolVersion == nil || hello.ProtocolVersion.Major != 1 || hello.ProtocolVersion.Minor != 1 {
+		t.Fatalf("server protocol=%v, want 1.1", hello.ProtocolVersion)
 	}
 	if hello.ConnectionId == "" || hello.HostId == "" || hello.HostRunId == "" {
 		t.Fatalf("server hello missing identities: %+v", hello)

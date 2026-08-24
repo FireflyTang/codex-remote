@@ -38,6 +38,7 @@ type ServerConfig struct {
 	MaxWatches                     int
 	HostID, HostRunID, HostVersion string
 	Hello                          func(context.Context) (*remotev1.ServerHello, error)
+	RenewForegroundCodexes         func(context.Context, []string) error
 	AuditError                     func(error)
 }
 
@@ -214,8 +215,8 @@ func (c *connection) handleRaw(typ websocket.MessageType, raw []byte, helloOnly 
 			c.protocolClose(remotev1.CloseCode_CLOSE_CODE_HELLO_REQUIRED, "ClientHello must be the first frame", websocket.StatusProtocolError)
 			return false
 		}
-		if h.ClientId == "" || h.ClientRunId == "" || h.ProtocolVersion == nil || h.ProtocolVersion.Major != 1 || h.ProtocolVersion.Minor != 0 {
-			c.protocolClose(remotev1.CloseCode_CLOSE_CODE_PROTOCOL_VERSION_UNSUPPORTED, "protocol 1.0 and client identity are required", websocket.StatusProtocolError)
+		if h.ClientId == "" || h.ClientRunId == "" || h.ProtocolVersion == nil || h.ProtocolVersion.Major != 1 || h.ProtocolVersion.Minor != 1 {
+			c.protocolClose(remotev1.CloseCode_CLOSE_CODE_PROTOCOL_VERSION_UNSUPPORTED, "protocol 1.1 and client identity are required", websocket.StatusProtocolError)
 			return false
 		}
 		c.clientID = h.ClientId
@@ -233,6 +234,10 @@ func (c *connection) handleRaw(typ websocket.MessageType, raw []byte, helloOnly 
 		p := frame.GetPing()
 		c.enqueue(&remotev1.Frame{Payload: &remotev1.Frame_Pong{Pong: &remotev1.Pong{Nonce: p.Nonce, PingSentAtUnixMs: p.SentAtUnixMs, PongSentAtUnixMs: time.Now().UnixMilli()}}})
 	case frame.GetPong() != nil:
+		ids := frame.GetPong().GetForegroundCodexIds()
+		if len(ids) > 0 && c.server.cfg.RenewForegroundCodexes != nil {
+			c.reportAudit(c.server.cfg.RenewForegroundCodexes(c.ctx, append([]string(nil), ids...)))
+		}
 	case frame.GetClose() != nil:
 		return false
 	default:
@@ -243,14 +248,14 @@ func (c *connection) handleRaw(typ websocket.MessageType, raw []byte, helloOnly 
 }
 
 func (c *connection) sendHello() {
-	hello := &remotev1.ServerHello{ConnectionId: c.id, HostId: c.server.cfg.HostID, HostRunId: c.server.cfg.HostRunID, ProtocolVersion: &remotev1.ProtocolVersion{Major: 1, Minor: 0}, HostVersion: c.server.cfg.HostVersion, HeartbeatIntervalMs: uint64(c.server.cfg.HeartbeatInterval.Milliseconds()), ConnectionTimeoutMs: uint64(c.server.cfg.ConnectionTimeout.Milliseconds()), MaxFrameBytes: uint64(c.server.cfg.MaxFrameBytes)}
+	hello := &remotev1.ServerHello{ConnectionId: c.id, HostId: c.server.cfg.HostID, HostRunId: c.server.cfg.HostRunID, ProtocolVersion: &remotev1.ProtocolVersion{Major: 1, Minor: 1}, HostVersion: c.server.cfg.HostVersion, HeartbeatIntervalMs: uint64(c.server.cfg.HeartbeatInterval.Milliseconds()), ConnectionTimeoutMs: uint64(c.server.cfg.ConnectionTimeout.Milliseconds()), MaxFrameBytes: uint64(c.server.cfg.MaxFrameBytes)}
 	if c.server.cfg.Hello != nil {
 		if provided, err := c.server.cfg.Hello(c.ctx); err == nil && provided != nil {
 			hello = provided
 			hello.ConnectionId = c.id
 			hello.HostId = c.server.cfg.HostID
 			hello.HostRunId = c.server.cfg.HostRunID
-			hello.ProtocolVersion = &remotev1.ProtocolVersion{Major: 1, Minor: 0}
+			hello.ProtocolVersion = &remotev1.ProtocolVersion{Major: 1, Minor: 1}
 			hello.HeartbeatIntervalMs = uint64(c.server.cfg.HeartbeatInterval.Milliseconds())
 			hello.ConnectionTimeoutMs = uint64(c.server.cfg.ConnectionTimeout.Milliseconds())
 			hello.MaxFrameBytes = uint64(c.server.cfg.MaxFrameBytes)

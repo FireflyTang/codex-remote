@@ -27,6 +27,13 @@ type Backend interface {
 	InterruptTurn(context.Context, *remotev1.InterruptTurnRequest) (*remotev1.InterruptTurnResponse, error)
 	RespondApproval(context.Context, *remotev1.RespondApprovalRequest) (*remotev1.RespondApprovalResponse, error)
 	RespondUserInput(context.Context, *remotev1.RespondUserInputRequest) (*remotev1.RespondUserInputResponse, error)
+	UnmanageCodex(context.Context, *remotev1.UnmanageCodexRequest) (*remotev1.UnmanageCodexResponse, error)
+	GetWorkspace(context.Context, *remotev1.GetWorkspaceRequest) (*remotev1.GetWorkspaceResponse, error)
+	ListWorkspaceEntries(context.Context, *remotev1.ListWorkspaceEntriesRequest) (*remotev1.ListWorkspaceEntriesResponse, error)
+	ReadWorkspaceTextFile(context.Context, *remotev1.ReadWorkspaceTextFileRequest) (*remotev1.ReadWorkspaceTextFileResponse, error)
+	WriteWorkspaceTextFile(context.Context, *remotev1.WriteWorkspaceTextFileRequest) (*remotev1.WriteWorkspaceTextFileResponse, error)
+	UploadWorkspaceEntry(context.Context, *remotev1.UploadWorkspaceEntryRequest) (*remotev1.UploadWorkspaceEntryResponse, error)
+	DownloadWorkspaceEntry(context.Context, *remotev1.DownloadWorkspaceEntryRequest) (*remotev1.DownloadWorkspaceEntryResponse, error)
 }
 
 type DedupStore interface {
@@ -177,6 +184,34 @@ func (d *Dispatcher) call(ctx context.Context, req *remotev1.Request) (*remotev1
 		var v *remotev1.RespondUserInputResponse
 		v, err = d.Backend.RespondUserInput(ctx, x.RespondUserInput)
 		resp.Result = &remotev1.Response_RespondUserInput{RespondUserInput: v}
+	case *remotev1.Request_UnmanageCodex:
+		var v *remotev1.UnmanageCodexResponse
+		v, err = d.Backend.UnmanageCodex(ctx, x.UnmanageCodex)
+		resp.Result = &remotev1.Response_UnmanageCodex{UnmanageCodex: v}
+	case *remotev1.Request_GetWorkspace:
+		var v *remotev1.GetWorkspaceResponse
+		v, err = d.Backend.GetWorkspace(ctx, x.GetWorkspace)
+		resp.Result = &remotev1.Response_GetWorkspace{GetWorkspace: v}
+	case *remotev1.Request_ListWorkspaceEntries:
+		var v *remotev1.ListWorkspaceEntriesResponse
+		v, err = d.Backend.ListWorkspaceEntries(ctx, x.ListWorkspaceEntries)
+		resp.Result = &remotev1.Response_ListWorkspaceEntries{ListWorkspaceEntries: v}
+	case *remotev1.Request_ReadWorkspaceTextFile:
+		var v *remotev1.ReadWorkspaceTextFileResponse
+		v, err = d.Backend.ReadWorkspaceTextFile(ctx, x.ReadWorkspaceTextFile)
+		resp.Result = &remotev1.Response_ReadWorkspaceTextFile{ReadWorkspaceTextFile: v}
+	case *remotev1.Request_WriteWorkspaceTextFile:
+		var v *remotev1.WriteWorkspaceTextFileResponse
+		v, err = d.Backend.WriteWorkspaceTextFile(ctx, x.WriteWorkspaceTextFile)
+		resp.Result = &remotev1.Response_WriteWorkspaceTextFile{WriteWorkspaceTextFile: v}
+	case *remotev1.Request_UploadWorkspaceEntry:
+		var v *remotev1.UploadWorkspaceEntryResponse
+		v, err = d.Backend.UploadWorkspaceEntry(ctx, x.UploadWorkspaceEntry)
+		resp.Result = &remotev1.Response_UploadWorkspaceEntry{UploadWorkspaceEntry: v}
+	case *remotev1.Request_DownloadWorkspaceEntry:
+		var v *remotev1.DownloadWorkspaceEntryResponse
+		v, err = d.Backend.DownloadWorkspaceEntry(ctx, x.DownloadWorkspaceEntry)
+		resp.Result = &remotev1.Response_DownloadWorkspaceEntry{DownloadWorkspaceEntry: v}
 	default:
 		return errorResponse(req.RequestId, remotev1.ErrorCode_ERROR_CODE_INVALID_REQUEST, "unsupported request", false), nil
 	}
@@ -224,6 +259,20 @@ func operation(req *remotev1.Request) (string, bool) {
 		return "respond_approval", true
 	case *remotev1.Request_RespondUserInput:
 		return "respond_user_input", true
+	case *remotev1.Request_UnmanageCodex:
+		return "unmanage_codex", true
+	case *remotev1.Request_GetWorkspace:
+		return "get_workspace", false
+	case *remotev1.Request_ListWorkspaceEntries:
+		return "list_workspace_entries", false
+	case *remotev1.Request_ReadWorkspaceTextFile:
+		return "read_workspace_text_file", false
+	case *remotev1.Request_WriteWorkspaceTextFile:
+		return "write_workspace_text_file", true
+	case *remotev1.Request_UploadWorkspaceEntry:
+		return "upload_workspace_entry", true
+	case *remotev1.Request_DownloadWorkspaceEntry:
+		return "download_workspace_entry", false
 	default:
 		return "unknown", false
 	}
@@ -251,5 +300,11 @@ func markDeduplicated(r *remotev1.Response) {
 		x.RespondApproval.Deduplicated = true
 	case *remotev1.Response_RespondUserInput:
 		x.RespondUserInput.Deduplicated = true
+	case *remotev1.Response_UnmanageCodex:
+		x.UnmanageCodex.Deduplicated = true
+	case *remotev1.Response_WriteWorkspaceTextFile:
+		x.WriteWorkspaceTextFile.Deduplicated = true
+	case *remotev1.Response_UploadWorkspaceEntry:
+		x.UploadWorkspaceEntry.Deduplicated = true
 	}
 }

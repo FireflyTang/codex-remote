@@ -9,7 +9,7 @@ import (
 // This table is a compile-time guard that every frozen V1 RPC has a
 // constructible formal-wire request. Behavioral scenarios use the external
 // deterministic fixture once the Host exposes its local listener seam.
-func TestAllThirteenRPCsHaveFormalWireCases(t *testing.T) {
+func TestAllTwentyRPCsHaveFormalWireCases(t *testing.T) {
 	cases := []struct {
 		name string
 		req  *remotev1.Request
@@ -27,9 +27,16 @@ func TestAllThirteenRPCsHaveFormalWireCases(t *testing.T) {
 		{"InterruptTurn", &remotev1.Request{Request: &remotev1.Request_InterruptTurn{InterruptTurn: &remotev1.InterruptTurnRequest{}}}},
 		{"RespondApproval", &remotev1.Request{Request: &remotev1.Request_RespondApproval{RespondApproval: &remotev1.RespondApprovalRequest{}}}},
 		{"RespondUserInput", &remotev1.Request{Request: &remotev1.Request_RespondUserInput{RespondUserInput: &remotev1.RespondUserInputRequest{}}}},
+		{"UnmanageCodex", &remotev1.Request{Request: &remotev1.Request_UnmanageCodex{UnmanageCodex: &remotev1.UnmanageCodexRequest{}}}},
+		{"GetWorkspace", &remotev1.Request{Request: &remotev1.Request_GetWorkspace{GetWorkspace: &remotev1.GetWorkspaceRequest{}}}},
+		{"ListWorkspaceEntries", &remotev1.Request{Request: &remotev1.Request_ListWorkspaceEntries{ListWorkspaceEntries: &remotev1.ListWorkspaceEntriesRequest{}}}},
+		{"ReadWorkspaceTextFile", &remotev1.Request{Request: &remotev1.Request_ReadWorkspaceTextFile{ReadWorkspaceTextFile: &remotev1.ReadWorkspaceTextFileRequest{}}}},
+		{"WriteWorkspaceTextFile", &remotev1.Request{Request: &remotev1.Request_WriteWorkspaceTextFile{WriteWorkspaceTextFile: &remotev1.WriteWorkspaceTextFileRequest{}}}},
+		{"UploadWorkspaceEntry", &remotev1.Request{Request: &remotev1.Request_UploadWorkspaceEntry{UploadWorkspaceEntry: &remotev1.UploadWorkspaceEntryRequest{}}}},
+		{"DownloadWorkspaceEntry", &remotev1.Request{Request: &remotev1.Request_DownloadWorkspaceEntry{DownloadWorkspaceEntry: &remotev1.DownloadWorkspaceEntryRequest{}}}},
 	}
-	if len(cases) != 13 {
-		t.Fatalf("RPC cases=%d, want 13", len(cases))
+	if len(cases) != 20 {
+		t.Fatalf("RPC cases=%d, want 20", len(cases))
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

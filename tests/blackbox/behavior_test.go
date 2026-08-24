@@ -205,6 +205,20 @@ func request(id string, body any) *remotev1.Request {
 		r.Request = x
 	case *remotev1.Request_RespondUserInput:
 		r.Request = x
+	case *remotev1.Request_UnmanageCodex:
+		r.Request = x
+	case *remotev1.Request_GetWorkspace:
+		r.Request = x
+	case *remotev1.Request_ListWorkspaceEntries:
+		r.Request = x
+	case *remotev1.Request_ReadWorkspaceTextFile:
+		r.Request = x
+	case *remotev1.Request_WriteWorkspaceTextFile:
+		r.Request = x
+	case *remotev1.Request_UploadWorkspaceEntry:
+		r.Request = x
+	case *remotev1.Request_DownloadWorkspaceEntry:
+		r.Request = x
 	default:
 		panic("unsupported request body")
 	}

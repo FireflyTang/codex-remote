@@ -26,6 +26,7 @@ import (
 	"github.com/kylin1993/codex-remote/internal/persistence"
 	"github.com/kylin1993/codex-remote/internal/runtime"
 	"github.com/kylin1993/codex-remote/internal/session"
+	workspacecore "github.com/kylin1993/codex-remote/internal/workspace"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 )
@@ -35,6 +36,8 @@ type Runtime interface {
 	Events() <-chan adapter.Event
 	State() runtime.State
 }
+
+type eventPublisher func(context.Context, *remotev1.Event, *remotev1.CurrentView, *remotev1.Provenance, string) (*remotev1.Event, error)
 
 type Manager struct {
 	Runtime             Runtime
@@ -47,48 +50,143 @@ type Manager struct {
 	MaxPage             uint32
 	ContentBudget       int
 	Degraded            func() (bool, string)
+	Clock               func() time.Time
+	LeaseDuration       time.Duration
+	LeaseWarningBefore  time.Duration
+	LeaseSweepInterval  time.Duration
+	Workspaces          *workspacecore.Service
 	commitMu            sync.Mutex
 	mu                  sync.RWMutex
 	byID                map[string]*remotev1.CurrentView
 	byThread            map[string]string
 	bySession           map[string]string
 	sources             map[string]string
+	warningDeadline     map[string]int64
 	chunks              map[string]uint64
+	workspaceChildCodex map[string]string
+	workspaceChildState map[string]workspaceChildObservation
 	asyncError          string
 	testBeforeCommit    func(string)
+	testPublishEvent    eventPublisher
 }
 
 func NewManager(rt Runtime, p *persistence.Store, events *activity.Store, dirs directory.Service, caps *capability.Service, hostID, version string) *Manager {
-	m := &Manager{Runtime: rt, Persistence: p, Events: events, Directories: dirs, Capabilities: caps, HostID: hostID, HostVersion: version, StartedAt: time.Now(), MaxPage: 100, ContentBudget: 256 << 10, byID: make(map[string]*remotev1.CurrentView), byThread: make(map[string]string), bySession: make(map[string]string), sources: make(map[string]string), chunks: make(map[string]uint64)}
+	m := &Manager{Runtime: rt, Persistence: p, Events: events, Directories: dirs, Capabilities: caps, HostID: hostID, HostVersion: version, StartedAt: time.Now(), MaxPage: 100, ContentBudget: 256 << 10, byID: make(map[string]*remotev1.CurrentView), byThread: make(map[string]string), bySession: make(map[string]string), sources: make(map[string]string), warningDeadline: make(map[string]int64), chunks: make(map[string]uint64)}
+	ws, _ := workspacecore.New(workspacecore.Config{})
+	m.SetWorkspaceService(ws)
 	return m
+}
+
+func (m *Manager) now() time.Time {
+	if m.Clock != nil {
+		return m.Clock()
+	}
+	return time.Now()
+}
+
+func (m *Manager) leaseDuration() time.Duration {
+	if m.LeaseDuration > 0 {
+		return m.LeaseDuration
+	}
+	return 2 * time.Hour
+}
+
+func (m *Manager) leaseWarningBefore() time.Duration {
+	if m.LeaseWarningBefore > 0 {
+		return m.LeaseWarningBefore
+	}
+	return 30 * time.Minute
+}
+
+func (m *Manager) leaseSweepInterval() time.Duration {
+	if m.LeaseSweepInterval > 0 {
+		return m.LeaseSweepInterval
+	}
+	return time.Minute
 }
 
 // Restore reopens all managed threads and constructs restart RESET views. It
 // must be called whenever Runtime becomes Ready, not only at Host startup.
 func (m *Manager) Restore(ctx context.Context) error {
+	m.commitMu.Lock()
+	err := m.restoreLocked(ctx)
+	m.commitMu.Unlock()
+	if err != nil {
+		return err
+	}
+	// sweepLease takes commitMu per Codex, so it must run after the restore
+	// transaction releases the global state-commit boundary.
+	return m.sweepLeases(ctx)
+}
+
+func (m *Manager) restoreLocked(ctx context.Context) error {
 	records, err := m.Persistence.ListCodexes(ctx, 100000, 0)
 	if err != nil {
 		return err
+	}
+	if m.testBeforeCommit != nil {
+		m.testBeforeCommit("restore")
 	}
 	ad, err := m.Runtime.Adapter()
 	if err != nil {
 		return err
 	}
 	for _, r := range records {
+		c := codexFromRecord(r)
+		if c.ManagementState == remotev1.ManagementState_MANAGEMENT_STATE_UNSPECIFIED {
+			c.ManagementState = remotev1.ManagementState_MANAGEMENT_STATE_MANAGED
+			c.ManagedUntilUnixMs = m.now().Add(m.leaseDuration()).UnixMilli()
+			r.ManagementState = c.ManagementState.String()
+			r.ManagedUntilUnixMS = c.ManagedUntilUnixMs
+			r.WarningDeadlineUnixMS = 0
+		}
+		if c.ManagementState == remotev1.ManagementState_MANAGEMENT_STATE_UNMANAGED {
+			view := &remotev1.CurrentView{Codex: c, GeneratedAtUnixMs: m.now().UnixMilli()}
+			if len(r.CurrentViewJSON) > 0 {
+				persisted := new(remotev1.CurrentView)
+				if protojson.Unmarshal(r.CurrentViewJSON, persisted) == nil {
+					view = persisted
+					if view.Codex == nil {
+						view.Codex = c
+					} else {
+						view.Codex.ManagementState = c.ManagementState
+						view.Codex.ManagedUntilUnixMs = c.ManagedUntilUnixMs
+					}
+				}
+			}
+			if err := m.ensureWorkspace(r.CodexID, c.Cwd, view); err != nil {
+				return err
+			}
+			m.registerRestored(r, view)
+			if err := m.persistState(ctx, view); err != nil {
+				return err
+			}
+			continue
+		}
 		thread, readErr := ad.ReadThread(ctx, r.ThreadID, true)
 		if readErr != nil {
-			c := codexFromRecord(r)
+			persistedAgents := uint32(0)
+			if len(r.CurrentViewJSON) > 0 {
+				persisted := new(remotev1.CurrentView)
+				if protojson.Unmarshal(r.CurrentViewJSON, persisted) == nil && persisted.WorkspaceAccessState != nil {
+					persistedAgents = persisted.WorkspaceAccessState.ActiveAgentCount
+				}
+			}
 			c.Status = remotev1.CodexStatus_CODEX_STATUS_UNAVAILABLE
 			c.ActiveTurnId = ""
-			view := &remotev1.CurrentView{Codex: c, GeneratedAtUnixMs: time.Now().UnixMilli()}
+			view := &remotev1.CurrentView{Codex: c, GeneratedAtUnixMs: m.now().UnixMilli()}
 			m.noteUnrecoverablePending(ctx, r.CodexID, view)
-			m.mu.Lock()
-			m.ensureMapsLocked()
-			m.byID[r.CodexID] = view
-			m.byThread[r.ThreadID] = r.CodexID
-			m.bySession[sessionKey(r.SessionSource, r.ThreadID)] = r.CodexID
-			m.sources[r.CodexID] = normalizeSourceString(r.SessionSource)
-			m.mu.Unlock()
+			if err := m.ensureWorkspace(r.CodexID, c.Cwd, view); err != nil {
+				return err
+			}
+			if r.ActiveTurnID != "" || persistedAgents > 0 {
+				state, err := m.Workspaces.RestoreAgent(r.CodexID, r.ActiveTurnID)
+				if err != nil {
+					return err
+				}
+				view.WorkspaceAccessState = state
+			}
+			m.registerRestored(r, view)
 			if err := m.persistState(ctx, view); err != nil {
 				return err
 			}
@@ -97,33 +195,52 @@ func (m *Manager) Restore(ctx context.Context) error {
 		if _, err := ad.ResumeThread(ctx, r.ThreadID); err != nil {
 			return fmt.Errorf("resume managed thread %s: %w", r.ThreadID, err)
 		}
-		c := codexFromRecord(r)
 		reconcileRestoredThreadTitle(c, thread)
-		view := &remotev1.CurrentView{Codex: c, GeneratedAtUnixMs: time.Now().UnixMilli()}
+		// Active RPC correlation cannot survive a Host restart. Start from a
+		// conservative idle snapshot and only mark an upstream running turn as
+		// unavailable below.
+		c.Status = remotev1.CodexStatus_CODEX_STATUS_IDLE
+		c.ActiveTurnId = ""
+		view := &remotev1.CurrentView{Codex: c, GeneratedAtUnixMs: m.now().UnixMilli()}
 		m.noteUnrecoverablePending(ctx, r.CodexID, view)
+		if err := m.ensureWorkspace(r.CodexID, c.Cwd, view); err != nil {
+			return err
+		}
+		if state, err := m.restoreCollabAgents(r.CodexID, thread); err != nil {
+			return err
+		} else if state != nil {
+			view.WorkspaceAccessState = state
+		}
 		if len(thread.Turns) > 0 {
 			last := thread.Turns[len(thread.Turns)-1]
 			if turnStatus(last.Status) == remotev1.TurnStatus_TURN_STATUS_RUNNING {
 				// Active app-server RPC state cannot be hot-restored.
 				view.Codex.Status = remotev1.CodexStatus_CODEX_STATUS_UNAVAILABLE
 				view.Codex.ActiveTurnId = ""
-			} else {
-				view.Codex.Status = remotev1.CodexStatus_CODEX_STATUS_IDLE
-				view.Codex.ActiveTurnId = ""
+				state, err := m.Workspaces.RestoreAgent(r.CodexID, last.ID)
+				if err != nil {
+					return err
+				}
+				view.WorkspaceAccessState = state
 			}
 		}
-		m.mu.Lock()
-		m.ensureMapsLocked()
-		m.byID[r.CodexID] = view
-		m.byThread[r.ThreadID] = r.CodexID
-		m.bySession[sessionKey(r.SessionSource, r.ThreadID)] = r.CodexID
-		m.sources[r.CodexID] = normalizeSourceString(r.SessionSource)
-		m.mu.Unlock()
+		m.registerRestored(r, view)
 		if err := m.persistState(ctx, view); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (m *Manager) registerRestored(r persistence.CodexRecord, view *remotev1.CurrentView) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ensureMapsLocked()
+	m.byID[r.CodexID] = view
+	m.byThread[r.ThreadID] = r.CodexID
+	m.bySession[sessionKey(r.SessionSource, r.ThreadID)] = r.CodexID
+	m.sources[r.CodexID] = normalizeSourceString(r.SessionSource)
+	m.warningDeadline[r.CodexID] = r.WarningDeadlineUnixMS
 }
 
 func (m *Manager) RunEvents(ctx context.Context) {
@@ -283,7 +400,8 @@ func (m *Manager) CreateCodex(ctx context.Context, req *remotev1.CreateCodexRequ
 	if title == "" && t.Name != nil {
 		title = *t.Name
 	}
-	c := &remotev1.Codex{CodexId: newID("cdx"), ThreadId: t.ID, Cwd: t.CWD, Title: title, Origin: remotev1.CodexOrigin_CODEX_ORIGIN_REMOTE_CREATED, Status: remotev1.CodexStatus_CODEX_STATUS_IDLE, CreatedAtUnixMs: time.Now().UnixMilli(), LastActivityAtUnixMs: time.Now().UnixMilli()}
+	now := m.now()
+	c := &remotev1.Codex{CodexId: newID("cdx"), ThreadId: t.ID, Cwd: t.CWD, Title: title, Origin: remotev1.CodexOrigin_CODEX_ORIGIN_REMOTE_CREATED, Status: remotev1.CodexStatus_CODEX_STATUS_IDLE, ManagementState: remotev1.ManagementState_MANAGEMENT_STATE_MANAGED, ManagedUntilUnixMs: now.Add(m.leaseDuration()).UnixMilli(), CreatedAtUnixMs: now.UnixMilli(), LastActivityAtUnixMs: now.UnixMilli()}
 	source := normalizeSource(t.Source)
 	if err = m.saveCodex(ctx, c, source); err != nil {
 		return nil, err
@@ -339,8 +457,8 @@ func (m *Manager) ImportSession(ctx context.Context, req *remotev1.ImportSession
 	if t.Name != nil {
 		title = *t.Name
 	}
-	now := time.Now().UnixMilli()
-	c := &remotev1.Codex{CodexId: newID("cdx"), ThreadId: t.ID, Cwd: t.CWD, Title: title, Origin: remotev1.CodexOrigin_CODEX_ORIGIN_LOCAL_EXISTING, Status: remotev1.CodexStatus_CODEX_STATUS_IDLE, CreatedAtUnixMs: unixMillis(t.CreatedAt), ImportedAtUnixMs: now, LastActivityAtUnixMs: now}
+	now := m.now()
+	c := &remotev1.Codex{CodexId: newID("cdx"), ThreadId: t.ID, Cwd: t.CWD, Title: title, Origin: remotev1.CodexOrigin_CODEX_ORIGIN_LOCAL_EXISTING, Status: remotev1.CodexStatus_CODEX_STATUS_IDLE, ManagementState: remotev1.ManagementState_MANAGEMENT_STATE_MANAGED, ManagedUntilUnixMs: now.Add(m.leaseDuration()).UnixMilli(), CreatedAtUnixMs: unixMillis(t.CreatedAt), ImportedAtUnixMs: now.UnixMilli(), LastActivityAtUnixMs: now.UnixMilli()}
 	if err = m.saveCodex(ctx, c, actualSource); err != nil {
 		return nil, err
 	}
@@ -406,6 +524,11 @@ func (m *Manager) StartTurn(ctx context.Context, req *remotev1.StartTurnRequest)
 	if err != nil {
 		return nil, rpcErr(remotev1.ErrorCode_ERROR_CODE_RUNTIME_UNAVAILABLE, err)
 	}
+	if c.ManagementState == remotev1.ManagementState_MANAGEMENT_STATE_UNMANAGED {
+		if _, err = ad.ResumeThread(ctx, c.ThreadId); err != nil {
+			return nil, err
+		}
+	}
 	var input []adapter.TextInput
 	for _, p := range req.Input {
 		if t := p.GetText(); t != nil {
@@ -423,10 +546,276 @@ func (m *Manager) StartTurn(ctx context.Context, req *remotev1.StartTurnRequest)
 	if err != nil {
 		return nil, err
 	}
+	workspaceErr := m.WorkspaceAgentStarted(ctx, req.CodexId, turn.ID)
+	if workspaceErr != nil {
+		m.noteAsyncError(workspaceErr)
+	}
 	if err := m.setRunning(ctx, req.CodexId, turn.ID, gateway.RequestIDFromContext(ctx)); err != nil {
-		return nil, err
+		return nil, errors.Join(workspaceErr, err)
+	}
+	if workspaceErr != nil {
+		return nil, workspaceErr
 	}
 	return &remotev1.StartTurnResponse{TurnId: turn.ID}, nil
+}
+
+func (m *Manager) UnmanageCodex(ctx context.Context, req *remotev1.UnmanageCodexRequest) (*remotev1.UnmanageCodexResponse, error) {
+	if req == nil || req.CodexId == "" {
+		return nil, rpcErr(remotev1.ErrorCode_ERROR_CODE_INVALID_REQUEST, errors.New("codex id is required"))
+	}
+	m.commitMu.Lock()
+	defer m.commitMu.Unlock()
+	m.mu.Lock()
+	m.ensureMapsLocked()
+	view := m.byID[req.CodexId]
+	if view == nil || view.Codex == nil {
+		m.mu.Unlock()
+		return nil, rpcErr(remotev1.ErrorCode_ERROR_CODE_CODEX_NOT_FOUND, errors.New("codex not found"))
+	}
+	snapshot := proto.Clone(view).(*remotev1.CurrentView)
+	original := proto.Clone(view).(*remotev1.CurrentView)
+	if snapshot.Codex.ManagementState == remotev1.ManagementState_MANAGEMENT_STATE_UNMANAGED {
+		m.mu.Unlock()
+		return &remotev1.UnmanageCodexResponse{Codex: proto.Clone(snapshot.Codex).(*remotev1.Codex)}, nil
+	}
+	if manualUnmanageBusy(snapshot) {
+		m.mu.Unlock()
+		return nil, rpcErr(remotev1.ErrorCode_ERROR_CODE_CODEX_BUSY, errors.New("codex is busy"))
+	}
+	oldWarning := m.warningDeadline[req.CodexId]
+	m.warningDeadline[req.CodexId] = 0
+	snapshot.Codex.ManagementState = remotev1.ManagementState_MANAGEMENT_STATE_UNMANAGED
+	snapshot.Codex.ManagedUntilUnixMs = 0
+	snapshot.GeneratedAtUnixMs = m.now().UnixMilli()
+	m.mu.Unlock()
+	if err := m.persistState(ctx, snapshot); err != nil {
+		m.mu.Lock()
+		m.warningDeadline[req.CodexId] = oldWarning
+		m.mu.Unlock()
+		return nil, err
+	}
+	m.mu.Lock()
+	m.byID[req.CodexId] = snapshot
+	m.mu.Unlock()
+	if err := m.publishCodex(ctx, snapshot.Codex, gateway.RequestIDFromContext(ctx)); err != nil {
+		if errors.Is(err, persistence.ErrEventCommitOutcomeUnknown) {
+			return nil, m.preserveLifecycleState(ctx, req.CodexId, snapshot, 0, false, err)
+		}
+		return nil, m.rollbackLifecycleState(ctx, req.CodexId, original, oldWarning, err)
+	}
+	return &remotev1.UnmanageCodexResponse{Codex: proto.Clone(snapshot.Codex).(*remotev1.Codex)}, nil
+}
+
+func manualUnmanageBusy(view *remotev1.CurrentView) bool {
+	if view == nil || view.Codex == nil {
+		return false
+	}
+	switch view.Codex.Status {
+	case remotev1.CodexStatus_CODEX_STATUS_RUNNING,
+		remotev1.CodexStatus_CODEX_STATUS_WAITING_FOR_APPROVAL,
+		remotev1.CodexStatus_CODEX_STATUS_WAITING_FOR_USER_INPUT,
+		remotev1.CodexStatus_CODEX_STATUS_INTERRUPTING:
+		return true
+	}
+	return view.Codex.ActiveTurnId != "" || view.ActiveTurn != nil || len(view.PendingRequests) != 0
+}
+
+func automaticUnmanageSafe(view *remotev1.CurrentView) bool {
+	return view != nil && view.Codex != nil && view.Codex.Status == remotev1.CodexStatus_CODEX_STATUS_IDLE && !manualUnmanageBusy(view)
+}
+
+func hasManagementWarning(warnings []*remotev1.Warning, deadline int64) bool {
+	for _, warning := range warnings {
+		if warning != nil && warning.Code == remotev1.WarningCode_WARNING_CODE_MANAGEMENT_EXPIRING_SOON && warning.ManagedUntilUnixMs == deadline {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) renewLease(ctx context.Context, codexID string) error {
+	m.commitMu.Lock()
+	defer m.commitMu.Unlock()
+	now := m.now()
+	m.mu.Lock()
+	m.ensureMapsLocked()
+	view := m.byID[codexID]
+	if view == nil || view.Codex == nil {
+		m.mu.Unlock()
+		return rpcErr(remotev1.ErrorCode_ERROR_CODE_CODEX_NOT_FOUND, errors.New("codex not found"))
+	}
+	if view.Codex.ManagementState == remotev1.ManagementState_MANAGEMENT_STATE_UNMANAGED {
+		m.mu.Unlock()
+		return nil
+	}
+	snapshot := proto.Clone(view).(*remotev1.CurrentView)
+	original := proto.Clone(view).(*remotev1.CurrentView)
+	oldWarning := m.warningDeadline[codexID]
+	m.warningDeadline[codexID] = 0
+	snapshot.Codex.ManagementState = remotev1.ManagementState_MANAGEMENT_STATE_MANAGED
+	snapshot.Codex.ManagedUntilUnixMs = now.Add(m.leaseDuration()).UnixMilli()
+	snapshot.Codex.LastActivityAtUnixMs = now.UnixMilli()
+	snapshot.GeneratedAtUnixMs = now.UnixMilli()
+	m.mu.Unlock()
+	if err := m.persistState(ctx, snapshot); err != nil {
+		m.mu.Lock()
+		m.warningDeadline[codexID] = oldWarning
+		m.mu.Unlock()
+		return err
+	}
+	m.mu.Lock()
+	m.byID[codexID] = snapshot
+	m.mu.Unlock()
+	if err := m.publishCodex(ctx, snapshot.Codex, ""); err != nil {
+		if errors.Is(err, persistence.ErrEventCommitOutcomeUnknown) {
+			return m.preserveLifecycleState(ctx, codexID, snapshot, 0, false, err)
+		}
+		return m.rollbackLifecycleState(ctx, codexID, original, oldWarning, err)
+	}
+	return nil
+}
+
+func (m *Manager) RenewForegroundCodexes(ctx context.Context, ids []string) error {
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		seen[id] = struct{}{}
+		m.mu.RLock()
+		view := m.byID[id]
+		eligible := view != nil && view.Codex != nil && (view.Codex.ManagementState == remotev1.ManagementState_MANAGEMENT_STATE_MANAGED || view.Codex.ManagementState == remotev1.ManagementState_MANAGEMENT_STATE_EXPIRING_SOON)
+		m.mu.RUnlock()
+		if eligible {
+			if err := m.renewLease(ctx, id); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (m *Manager) RunLeaseSweeper(ctx context.Context) {
+	if err := m.sweepLeases(ctx); err != nil {
+		m.noteAsyncError(err)
+	}
+	ticker := time.NewTicker(m.leaseSweepInterval())
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := m.sweepLeases(ctx); err != nil {
+				m.noteAsyncError(err)
+			}
+		}
+	}
+}
+
+func (m *Manager) sweepLeases(ctx context.Context) error {
+	m.mu.RLock()
+	ids := make([]string, 0, len(m.byID))
+	for id := range m.byID {
+		ids = append(ids, id)
+	}
+	m.mu.RUnlock()
+	for _, id := range ids {
+		if err := m.sweepLease(ctx, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *Manager) sweepLease(ctx context.Context, codexID string) error {
+	m.commitMu.Lock()
+	defer m.commitMu.Unlock()
+	now := m.now()
+	m.mu.Lock()
+	m.ensureMapsLocked()
+	view := m.byID[codexID]
+	if view == nil || view.Codex == nil {
+		m.mu.Unlock()
+		return nil
+	}
+	state := view.Codex.ManagementState
+	deadline := view.Codex.ManagedUntilUnixMs
+	if (state != remotev1.ManagementState_MANAGEMENT_STATE_MANAGED && state != remotev1.ManagementState_MANAGEMENT_STATE_EXPIRING_SOON) || deadline <= 0 {
+		m.mu.Unlock()
+		return nil
+	}
+	snapshot := proto.Clone(view).(*remotev1.CurrentView)
+	original := proto.Clone(view).(*remotev1.CurrentView)
+	oldWarning := m.warningDeadline[codexID]
+	newWarning := oldWarning
+	var warning *remotev1.Warning
+	changed := false
+	if now.UnixMilli() >= deadline && automaticUnmanageSafe(snapshot) {
+		snapshot.Codex.ManagementState = remotev1.ManagementState_MANAGEMENT_STATE_UNMANAGED
+		snapshot.Codex.ManagedUntilUnixMs = 0
+		newWarning = 0
+		changed = true
+	} else if now.UnixMilli() >= deadline-m.leaseWarningBefore().Milliseconds() {
+		if snapshot.Codex.ManagementState != remotev1.ManagementState_MANAGEMENT_STATE_EXPIRING_SOON {
+			snapshot.Codex.ManagementState = remotev1.ManagementState_MANAGEMENT_STATE_EXPIRING_SOON
+			changed = true
+		}
+		if oldWarning != deadline {
+			warning = &remotev1.Warning{Code: remotev1.WarningCode_WARNING_CODE_MANAGEMENT_EXPIRING_SOON, Message: "Codex management lease is expiring soon", ManagedUntilUnixMs: deadline, Metadata: map[string]string{"managed_until_unix_ms": fmt.Sprintf("%d", deadline)}}
+			if !hasManagementWarning(snapshot.Codex.Warnings, deadline) {
+				snapshot.Codex.Warnings = append(snapshot.Codex.Warnings, proto.Clone(warning).(*remotev1.Warning))
+			}
+			newWarning = deadline
+			changed = true
+		}
+	}
+	if !changed {
+		m.mu.Unlock()
+		return nil
+	}
+	snapshot.GeneratedAtUnixMs = now.UnixMilli()
+	m.warningDeadline[codexID] = newWarning
+	m.mu.Unlock()
+	if err := m.persistState(ctx, snapshot); err != nil {
+		m.mu.Lock()
+		m.warningDeadline[codexID] = oldWarning
+		m.mu.Unlock()
+		return err
+	}
+	m.mu.Lock()
+	m.byID[codexID] = snapshot
+	m.mu.Unlock()
+	if err := m.publishCodex(ctx, snapshot.Codex, ""); err != nil {
+		if errors.Is(err, persistence.ErrEventCommitOutcomeUnknown) {
+			// The transition event may have committed. Keep EXPIRING/new state,
+			// but clear the warning marker so the missing WarningRaised can retry.
+			marker := newWarning
+			persist := false
+			if warning != nil {
+				marker = 0
+				persist = true
+			}
+			return m.preserveLifecycleState(ctx, codexID, snapshot, marker, persist, err)
+		}
+		return m.rollbackLifecycleState(ctx, codexID, original, oldWarning, err)
+	}
+	if warning != nil {
+		if _, err := m.publishEvent(ctx, &remotev1.Event{CodexId: codexID, OccurredAtUnixMs: now.UnixMilli(), Event: &remotev1.Event_WarningRaised{WarningRaised: &remotev1.WarningRaised{Warning: warning}}}, snapshot, nil, ""); err != nil {
+			if errors.Is(err, persistence.ErrEventCommitOutcomeUnknown) {
+				// It may already be canonical. Keep the deadline marker to suppress
+				// duplicates and expose the uncertainty as degradation.
+				return m.preserveLifecycleState(ctx, codexID, snapshot, newWarning, false, err)
+			}
+			// CodexUpdated is already canonical. Preserve EXPIRING/current view,
+			// clear only the marker, and retry WarningRaised on the next sweep.
+			return m.preserveLifecycleState(ctx, codexID, snapshot, 0, true, err)
+		}
+	}
+	return nil
 }
 
 func (m *Manager) InterruptTurn(ctx context.Context, req *remotev1.InterruptTurnRequest) (*remotev1.InterruptTurnResponse, error) {
@@ -442,6 +831,9 @@ func (m *Manager) InterruptTurn(ctx context.Context, req *remotev1.InterruptTurn
 		return nil, err
 	}
 	if err = ad.InterruptTurn(ctx, c.ThreadId, req.TurnId); err != nil {
+		return nil, err
+	}
+	if err = m.renewLease(ctx, req.CodexId); err != nil {
 		return nil, err
 	}
 	return &remotev1.InterruptTurnResponse{TurnId: req.TurnId}, nil
@@ -475,6 +867,9 @@ func (m *Manager) RespondApproval(ctx context.Context, req *remotev1.RespondAppr
 	}
 	resolved := &remotev1.Approval{ApprovalId: req.ApprovalId, TurnId: p.TurnID, ItemId: p.ItemID, Status: map[bool]remotev1.ApprovalStatus{true: remotev1.ApprovalStatus_APPROVAL_STATUS_ALLOWED, false: remotev1.ApprovalStatus_APPROVAL_STATUS_DENIED}[req.Decision != remotev1.ApprovalDecision_APPROVAL_DECISION_DENY], ResolvedDecision: req.Decision, ResolvedAtUnixMs: time.Now().UnixMilli()}
 	if err := m.resolvePending(ctx, req.CodexId, req.ApprovalId, &remotev1.PendingRequest{Request: &remotev1.PendingRequest_Approval{Approval: resolved}}, gateway.RequestIDFromContext(ctx)); err != nil {
+		return nil, err
+	}
+	if err := m.renewLease(ctx, req.CodexId); err != nil {
 		return nil, err
 	}
 	return &remotev1.RespondApprovalResponse{Approval: resolved}, nil
@@ -535,13 +930,21 @@ func (m *Manager) RespondUserInput(ctx context.Context, req *remotev1.RespondUse
 	if err := m.resolvePending(ctx, req.CodexId, req.UserInputRequestId, &remotev1.PendingRequest{Request: &remotev1.PendingRequest_UserInput{UserInput: resolved}}, gateway.RequestIDFromContext(ctx)); err != nil {
 		return nil, err
 	}
+	if err := m.renewLease(ctx, req.CodexId); err != nil {
+		return nil, err
+	}
 	return &remotev1.RespondUserInputResponse{Request: resolved}, nil
 }
 
 func (m *Manager) saveCodex(ctx context.Context, c *remotev1.Codex, source string) error {
+	m.commitMu.Lock()
+	defer m.commitMu.Unlock()
 	source = normalizeSourceString(source)
 	r := recordFromCodex(c, source)
 	view := &remotev1.CurrentView{Codex: proto.Clone(c).(*remotev1.Codex), GeneratedAtUnixMs: time.Now().UnixMilli()}
+	if err := m.ensureWorkspace(c.CodexId, c.Cwd, view); err != nil {
+		return err
+	}
 	m.boundCurrentView(view)
 	raw, err := protojson.Marshal(view)
 	if err != nil {
@@ -557,6 +960,7 @@ func (m *Manager) saveCodex(ctx context.Context, c *remotev1.Codex, source strin
 	m.byThread[c.ThreadId] = c.CodexId
 	m.bySession[sessionKey(source, c.ThreadId)] = c.CodexId
 	m.sources[c.CodexId] = source
+	m.warningDeadline[c.CodexId] = 0
 	m.mu.Unlock()
 	return nil
 }
@@ -599,16 +1003,77 @@ func (m *Manager) persistState(ctx context.Context, v *remotev1.CurrentView) err
 	}
 	m.mu.RLock()
 	source := m.sources[v.Codex.CodexId]
+	warningDeadline := m.warningDeadline[v.Codex.CodexId]
 	m.mu.RUnlock()
 	r := recordFromCodex(v.Codex, source)
+	r.WarningDeadlineUnixMS = warningDeadline
 	r.CurrentViewJSON = raw
 	return m.Persistence.UpsertCodex(ctx, r)
 }
+
+func (m *Manager) rollbackLifecycleState(ctx context.Context, codexID string, original *remotev1.CurrentView, warningDeadline int64, publishErr error) error {
+	m.mu.Lock()
+	m.ensureMapsLocked()
+	m.warningDeadline[codexID] = warningDeadline
+	m.byID[codexID] = proto.Clone(original).(*remotev1.CurrentView)
+	m.mu.Unlock()
+	if err := m.persistState(ctx, original); err != nil {
+		rollbackErr := fmt.Errorf("rollback lifecycle state: %w", err)
+		combined := errors.Join(publishErr, rollbackErr)
+		m.noteAsyncError(combined)
+		return combined
+	}
+	if m.Events != nil {
+		if err := m.Events.ReloadDurable(ctx, codexID); err != nil {
+			rollbackErr := fmt.Errorf("reload rolled back lifecycle state: %w", err)
+			combined := errors.Join(publishErr, rollbackErr)
+			m.noteAsyncError(combined)
+			return combined
+		}
+	}
+	return publishErr
+}
+
+func (m *Manager) preserveLifecycleState(ctx context.Context, codexID string, snapshot *remotev1.CurrentView, warningDeadline int64, persist bool, outcomeErr error) error {
+	m.mu.Lock()
+	m.ensureMapsLocked()
+	m.warningDeadline[codexID] = warningDeadline
+	m.byID[codexID] = proto.Clone(snapshot).(*remotev1.CurrentView)
+	m.mu.Unlock()
+	if persist {
+		if err := m.persistState(ctx, snapshot); err != nil {
+			combined := errors.Join(outcomeErr, fmt.Errorf("persist uncertain lifecycle state: %w", err))
+			m.noteAsyncError(combined)
+			return combined
+		}
+	}
+	if m.Events != nil {
+		if err := m.Events.ReloadDurable(ctx, codexID); err != nil {
+			combined := errors.Join(outcomeErr, fmt.Errorf("reload uncertain lifecycle state: %w", err))
+			m.noteAsyncError(combined)
+			return combined
+		}
+	}
+	m.noteAsyncError(outcomeErr)
+	return outcomeErr
+}
+
+func (m *Manager) noteAsyncError(err error) {
+	if err == nil {
+		return
+	}
+	m.mu.Lock()
+	m.asyncError = err.Error()
+	m.mu.Unlock()
+}
+
 func (m *Manager) setRunning(ctx context.Context, id, turnID, requestID string) error {
 	m.commitMu.Lock()
 	defer m.commitMu.Unlock()
-	now := time.Now().UnixMilli()
+	nowTime := m.now()
+	now := nowTime.UnixMilli()
 	m.mu.Lock()
+	m.ensureMapsLocked()
 	v := m.byID[id]
 	if v == nil {
 		m.mu.Unlock()
@@ -620,6 +1085,9 @@ func (m *Manager) setRunning(ctx context.Context, id, turnID, requestID string) 
 	}
 	snapshot.Codex.ActiveTurnId = turnID
 	snapshot.Codex.LastActivityAtUnixMs = now
+	snapshot.Codex.ManagementState = remotev1.ManagementState_MANAGEMENT_STATE_MANAGED
+	snapshot.Codex.ManagedUntilUnixMs = nowTime.Add(m.leaseDuration()).UnixMilli()
+	m.warningDeadline[id] = 0
 	if snapshot.ActiveTurn == nil || snapshot.ActiveTurn.TurnId != turnID {
 		snapshot.ActiveTurn = &remotev1.TurnSnapshot{TurnId: turnID, Status: remotev1.TurnStatus_TURN_STATUS_RUNNING, StartedAtUnixMs: now}
 	} else {
@@ -635,15 +1103,31 @@ func (m *Manager) setRunning(ctx context.Context, id, turnID, requestID string) 
 		m.testBeforeCommit("set_running")
 	}
 	if err := m.persistState(ctx, snapshot); err != nil {
+		m.mu.Lock()
+		// StartTurn already succeeded upstream. Even when durability fails,
+		// retain the honest running/managed snapshot in memory so a retry cannot
+		// start a duplicate turn against an apparently unmanaged idle Codex.
+		m.warningDeadline[id] = 0
+		m.byID[id] = snapshot
+		m.mu.Unlock()
+		m.noteAsyncError(err)
 		return err
 	}
 	m.mu.Lock()
 	m.byID[id] = snapshot
 	m.mu.Unlock()
-	if _, err := m.Events.Publish(ctx, &remotev1.Event{CodexId: id, OccurredAtUnixMs: now, CausedByRequestId: requestID, Event: &remotev1.Event_TurnUpdated{TurnUpdated: &remotev1.TurnUpdated{TurnId: turnID, Status: remotev1.TurnStatus_TURN_STATUS_RUNNING, StartedAtUnixMs: now}}}, snapshot, nil, ""); err != nil {
+	if _, err := m.publishEvent(ctx, &remotev1.Event{CodexId: id, OccurredAtUnixMs: now, CausedByRequestId: requestID, Event: &remotev1.Event_TurnUpdated{TurnUpdated: &remotev1.TurnUpdated{TurnId: turnID, Status: remotev1.TurnStatus_TURN_STATUS_RUNNING, StartedAtUnixMs: now}}}, snapshot, nil, ""); err != nil {
+		// StartTurn already succeeded upstream. Keep the honest running snapshot
+		// (including its renewed lease) and return an unknown outcome rather than
+		// rolling back into a state that permits a duplicate upstream turn.
+		m.noteAsyncError(err)
 		return err
 	}
-	return m.publishCodex(ctx, snapshot.Codex, requestID)
+	if err := m.publishCodex(ctx, snapshot.Codex, requestID); err != nil {
+		m.noteAsyncError(err)
+		return err
+	}
+	return nil
 }
 
 func (m *Manager) publishCodex(ctx context.Context, c *remotev1.Codex, requestID string) error {
@@ -659,11 +1143,49 @@ func (m *Manager) publishCodex(ctx context.Context, c *remotev1.Codex, requestID
 	}
 	event := &remotev1.Event{CodexId: c.CodexId, OccurredAtUnixMs: time.Now().UnixMilli(), CausedByRequestId: requestID, Event: &remotev1.Event_CodexUpdated{CodexUpdated: &remotev1.CodexUpdated{Codex: proto.Clone(c).(*remotev1.Codex)}}}
 	m.boundCanonicalEvent(event)
-	_, err := m.Events.Publish(ctx, event, snapshot, &remotev1.Provenance{Kind: remotev1.ProvenanceKind_PROVENANCE_KIND_LIVE_WIRE, ObservedAtUnixMs: time.Now().UnixMilli()}, "")
+	_, err := m.publishEvent(ctx, event, snapshot, &remotev1.Provenance{Kind: remotev1.ProvenanceKind_PROVENANCE_KIND_LIVE_WIRE, ObservedAtUnixMs: time.Now().UnixMilli()}, "")
 	return err
 }
 
+func (m *Manager) publishEvent(ctx context.Context, event *remotev1.Event, view *remotev1.CurrentView, provenance *remotev1.Provenance, parentRecordID string) (*remotev1.Event, error) {
+	if m.testPublishEvent != nil {
+		return m.testPublishEvent(ctx, event, view, provenance, parentRecordID)
+	}
+	return m.Events.Publish(ctx, event, view, provenance, parentRecordID)
+}
+
 func (m *Manager) applyAdapterEvent(ctx context.Context, e adapter.Event) error {
+	if err := m.applyCollabAgentItem(ctx, e); err != nil {
+		return err
+	}
+	turnID := e.TurnID
+	if turnID == "" {
+		turnID = firstString(rawObject(e.Params), "turnId", "id")
+	}
+	status, _, _, _ := turnEvent(e)
+	terminal := e.Kind == adapter.EventTurnUpdated && status != remotev1.TurnStatus_TURN_STATUS_RUNNING
+	err := m.applyAdapterEventLocked(ctx, e)
+	if err == nil && terminal && turnID != "" {
+		m.mu.RLock()
+		codexID := m.byThread[e.ThreadID]
+		childCodexID := m.workspaceChildCodex[e.ThreadID]
+		m.mu.RUnlock()
+		if childCodexID != "" {
+			m.mu.Lock()
+			observation := m.workspaceChildState[e.ThreadID]
+			observation.Terminal = true
+			m.workspaceChildState[e.ThreadID] = observation
+			m.mu.Unlock()
+			return m.WorkspaceAgentStopped(ctx, childCodexID, "subagent:"+e.ThreadID)
+		}
+		if codexID != "" {
+			return m.WorkspaceAgentStopped(ctx, codexID, turnID)
+		}
+	}
+	return err
+}
+
+func (m *Manager) applyAdapterEventLocked(ctx context.Context, e adapter.Event) error {
 	m.commitMu.Lock()
 	defer m.commitMu.Unlock()
 	e.ItemID = canonicalEventItemID(e)
@@ -1182,7 +1704,7 @@ func turnStatus(v string) remotev1.TurnStatus {
 	}
 }
 func recordFromCodex(c *remotev1.Codex, source string) persistence.CodexRecord {
-	return persistence.CodexRecord{CodexID: c.CodexId, ThreadID: c.ThreadId, SessionSource: normalizeSourceString(source), CWD: c.Cwd, Title: c.Title, Origin: c.Origin.String(), Status: c.Status.String(), ActiveTurnID: c.ActiveTurnId, CreatedAtUnixMS: c.CreatedAtUnixMs, ImportedAtUnixMS: c.ImportedAtUnixMs, LastActivityAtUnixMS: c.LastActivityAtUnixMs}
+	return persistence.CodexRecord{CodexID: c.CodexId, ThreadID: c.ThreadId, SessionSource: normalizeSourceString(source), CWD: c.Cwd, Title: c.Title, Origin: c.Origin.String(), Status: c.Status.String(), ActiveTurnID: c.ActiveTurnId, ManagementState: c.ManagementState.String(), ManagedUntilUnixMS: c.ManagedUntilUnixMs, CreatedAtUnixMS: c.CreatedAtUnixMs, ImportedAtUnixMS: c.ImportedAtUnixMs, LastActivityAtUnixMS: c.LastActivityAtUnixMs}
 }
 func codexFromRecord(r persistence.CodexRecord) *remotev1.Codex {
 	origin := remotev1.CodexOrigin_CODEX_ORIGIN_REMOTE_CREATED
@@ -1193,7 +1715,11 @@ func codexFromRecord(r persistence.CodexRecord) *remotev1.Codex {
 	if n, ok := remotev1.CodexStatus_value[r.Status]; ok {
 		status = remotev1.CodexStatus(n)
 	}
-	return &remotev1.Codex{CodexId: r.CodexID, ThreadId: r.ThreadID, Cwd: r.CWD, Title: r.Title, Origin: origin, Status: status, ActiveTurnId: r.ActiveTurnID, CreatedAtUnixMs: r.CreatedAtUnixMS, ImportedAtUnixMs: r.ImportedAtUnixMS, LastActivityAtUnixMs: r.LastActivityAtUnixMS}
+	management := remotev1.ManagementState_MANAGEMENT_STATE_UNSPECIFIED
+	if n, ok := remotev1.ManagementState_value[r.ManagementState]; ok {
+		management = remotev1.ManagementState(n)
+	}
+	return &remotev1.Codex{CodexId: r.CodexID, ThreadId: r.ThreadID, Cwd: r.CWD, Title: r.Title, Origin: origin, Status: status, ActiveTurnId: r.ActiveTurnID, ManagementState: management, ManagedUntilUnixMs: r.ManagedUntilUnixMS, CreatedAtUnixMs: r.CreatedAtUnixMS, ImportedAtUnixMs: r.ImportedAtUnixMS, LastActivityAtUnixMs: r.LastActivityAtUnixMS}
 }
 func rpcErr(code remotev1.ErrorCode, err error) error {
 	return &gateway.RPCError{Detail: &remotev1.Error{Code: code, Message: err.Error()}}
@@ -1281,8 +1807,17 @@ func (m *Manager) ensureMapsLocked() {
 	if m.sources == nil {
 		m.sources = make(map[string]string)
 	}
+	if m.warningDeadline == nil {
+		m.warningDeadline = make(map[string]int64)
+	}
 	if m.chunks == nil {
 		m.chunks = make(map[string]uint64)
+	}
+	if m.workspaceChildCodex == nil {
+		m.workspaceChildCodex = make(map[string]string)
+	}
+	if m.workspaceChildState == nil {
+		m.workspaceChildState = make(map[string]workspaceChildObservation)
 	}
 }
 
@@ -1296,7 +1831,15 @@ func (m *Manager) noteUnrecoverablePending(ctx context.Context, codexID string, 
 		return
 	}
 	if old.Codex != nil {
-		view.Codex.Warnings = old.Codex.Warnings
+		view.Codex.Warnings = make([]*remotev1.Warning, 0, len(old.Codex.Warnings))
+		for _, warning := range old.Codex.Warnings {
+			if warning != nil {
+				view.Codex.Warnings = append(view.Codex.Warnings, proto.Clone(warning).(*remotev1.Warning))
+			}
+		}
+	}
+	if old.WorkspaceAccessState != nil {
+		view.WorkspaceAccessState = proto.Clone(old.WorkspaceAccessState).(*remotev1.WorkspaceAccessState)
 	}
 	view.Completeness = mergeCompleteness(view.Completeness, old.Completeness)
 	if len(old.PendingRequests) == 0 {

@@ -180,6 +180,31 @@ func (s *Store) reloadUnsafe(ctx context.Context, codexID string, st *stream) {
 	}
 }
 
+// ReloadDurable discards the cached replay suffix and reloads the canonical
+// CurrentView from persistence. State owners use this after rolling back a
+// failed event publication so RESET cannot expose the pre-rollback cache.
+func (s *Store) ReloadDurable(ctx context.Context, codexID string) error {
+	if codexID == "" {
+		return errors.New("codex id is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st := s.codex[codexID]
+	if st == nil {
+		st = &stream{watchers: make(map[uint64]*watcher)}
+		s.codex[codexID] = st
+	}
+	st.events = nil
+	st.replayUnsafe = true
+	st.safeReplayFloor = nil
+	if err := s.loadDurable(ctx, codexID, st); err != nil {
+		st.needsReload = true
+		return err
+	}
+	st.needsReload = false
+	return nil
+}
+
 func (s *Store) loadDurable(ctx context.Context, codexID string, st *stream) error {
 	head, raw, err := s.persist.LoadEventState(ctx, codexID)
 	if err != nil {

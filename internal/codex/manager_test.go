@@ -2,8 +2,13 @@ package codex
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -11,17 +16,165 @@ import (
 	"time"
 
 	remotev1 "github.com/FireflyTang/codex-remote-protocol/gen/go/codex/remote/v1"
+	"github.com/coder/websocket"
 	"github.com/kylin1993/codex-remote/internal/activity"
 	"github.com/kylin1993/codex-remote/internal/adapter"
 	"github.com/kylin1993/codex-remote/internal/gateway"
 	"github.com/kylin1993/codex-remote/internal/persistence"
+	hostruntime "github.com/kylin1993/codex-remote/internal/runtime"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 )
 
+type fixedAdapterRuntime struct {
+	adapter *adapter.Adapter
+}
+
+func (r fixedAdapterRuntime) Adapter() (*adapter.Adapter, error) { return r.adapter, nil }
+func (r fixedAdapterRuntime) Events() <-chan adapter.Event       { return r.adapter.Events() }
+func (fixedAdapterRuntime) State() hostruntime.State             { return hostruntime.State{} }
+
+func restoreTestAdapter(t *testing.T) *adapter.Adapter {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "app-server.sock")
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		for {
+			_, raw, err := conn.Read(context.Background())
+			if err != nil {
+				return
+			}
+			var message adapter.Message
+			if json.Unmarshal(raw, &message) != nil || len(message.ID) == 0 {
+				continue
+			}
+			result := any(map[string]any{})
+			switch message.Method {
+			case "thread/read", "thread/resume":
+				result = map[string]any{"thread": map[string]any{"id": "thread", "cwd": "/tmp", "turns": []any{}}}
+			case "turn/start":
+				result = map[string]any{"turn": map[string]any{"id": "turn", "status": "inProgress"}}
+			}
+			response, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": message.ID, "result": result})
+			if conn.Write(context.Background(), websocket.MessageText, response) != nil {
+				return
+			}
+		}
+	})}
+	go server.Serve(listener)
+	t.Cleanup(func() {
+		_ = server.Close()
+		_ = listener.Close()
+	})
+	client, err := adapter.Dial(context.Background(), path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ad, _, err := adapter.Initialize(context.Background(), client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ad.Close() })
+	return ad
+}
+
+func importTestAdapter(t *testing.T, cwd string) *adapter.Adapter {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "import-app-server.sock")
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		for {
+			_, raw, err := conn.Read(context.Background())
+			if err != nil {
+				return
+			}
+			var message adapter.Message
+			if json.Unmarshal(raw, &message) != nil || len(message.ID) == 0 {
+				continue
+			}
+			result := any(map[string]any{})
+			if message.Method == "thread/read" || message.Method == "thread/resume" {
+				result = map[string]any{"thread": map[string]any{"id": "historical-thread", "sessionId": "historical-thread", "cwd": cwd, "name": "historical", "source": "exec", "turns": []any{}}}
+			}
+			response, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": message.ID, "result": result})
+			if conn.Write(context.Background(), websocket.MessageText, response) != nil {
+				return
+			}
+		}
+	})}
+	go server.Serve(listener)
+	t.Cleanup(func() {
+		_ = server.Close()
+		_ = listener.Close()
+	})
+	client, err := adapter.Dial(context.Background(), path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ad, _, err := adapter.Initialize(context.Background(), client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ad.Close() })
+	return ad
+}
+
 func testManager(t *testing.T) *Manager {
 	t.Helper()
-	p, err := persistence.Open(filepath.Join(t.TempDir(), "state.db"))
+	m, _ := testManagerAt(t, filepath.Join(t.TempDir(), "state.db"))
+	return m
+}
+
+func TestImportSessionAllowsTemporarilyMissingWorkspaceRoot(t *testing.T) {
+	m := testManager(t)
+	root := filepath.Join(t.TempDir(), "missing", "historical-workspace")
+	m.Runtime = fixedAdapterRuntime{adapter: importTestAdapter(t, root)}
+	imported, err := m.ImportSession(context.Background(), &remotev1.ImportSessionRequest{SessionId: "historical-thread", Source: "exec"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if imported == nil || imported.Codex == nil || imported.Codex.Cwd != root {
+		t.Fatalf("imported=%+v", imported)
+	}
+	if _, err := m.GetWorkspace(context.Background(), &remotev1.GetWorkspaceRequest{CodexId: imported.Codex.CodexId}); err == nil {
+		t.Fatal("GetWorkspace succeeded while imported cwd was missing")
+	} else {
+		var rpc *gateway.RPCError
+		if !errors.As(err, &rpc) || rpc.Detail.GetCode() != remotev1.ErrorCode_ERROR_CODE_WORKSPACE_ENTRY_NOT_FOUND {
+			t.Fatalf("GetWorkspace error=%v", err)
+		}
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := m.GetWorkspace(context.Background(), &remotev1.GetWorkspaceRequest{CodexId: imported.Codex.CodexId})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if workspace.WorkspaceRoot != root || workspace.AccessState == nil {
+		t.Fatalf("workspace=%+v", workspace)
+	}
+}
+
+func testManagerAt(t *testing.T, path string) (*Manager, string) {
+	t.Helper()
+	p, err := persistence.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,7 +184,19 @@ func testManager(t *testing.T) *Manager {
 	if err = m.persistState(context.Background(), m.byID["c"]); err != nil {
 		t.Fatal(err)
 	}
-	return m
+	return m, path
+}
+
+func execSQLite(t *testing.T, path, statement string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(statement); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestSetRunningPersistsRegistryAndCorrelation(t *testing.T) {
@@ -169,6 +334,614 @@ func TestCodexAndWarningCanonicalEvents(t *testing.T) {
 	defer w.Cancel()
 	if len(w.Replay) != 2 || w.Replay[0].GetCodexUpdated() == nil || w.Replay[1].GetWarningRaised() == nil || w.Replay[1].GetWarningRaised().Warning.Message != "diagnostic" {
 		t.Fatalf("replay %+v", w.Replay)
+	}
+}
+
+func TestLeaseSweepWarningDedupAndAutomaticUnmanage(t *testing.T) {
+	m := testManager(t)
+	ctx := context.Background()
+	base := time.Unix(1_800_000_000, 0)
+	now := base.Add(89*time.Minute + 59*time.Second)
+	m.Clock = func() time.Time { return now }
+	m.LeaseDuration = 2 * time.Hour
+	m.LeaseWarningBefore = 30 * time.Minute
+	deadline := base.Add(2 * time.Hour).UnixMilli()
+	m.mu.Lock()
+	m.ensureMapsLocked()
+	m.byID["c"].Codex.ManagementState = remotev1.ManagementState_MANAGEMENT_STATE_MANAGED
+	m.byID["c"].Codex.ManagedUntilUnixMs = deadline
+	m.warningDeadline["c"] = 0
+	initial := proto.Clone(m.byID["c"]).(*remotev1.CurrentView)
+	m.mu.Unlock()
+	if err := m.persistState(ctx, initial); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.sweepLeases(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := m.lookup("c"); got.ManagementState != remotev1.ManagementState_MANAGEMENT_STATE_MANAGED {
+		t.Fatalf("89:59 state=%s", got.ManagementState)
+	}
+
+	now = base.Add(90 * time.Minute)
+	if err := m.sweepLeases(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.sweepLeases(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := m.lookup("c")
+	if got.ManagementState != remotev1.ManagementState_MANAGEMENT_STATE_EXPIRING_SOON || got.ManagedUntilUnixMs != deadline || len(got.Warnings) != 1 || got.Warnings[0].Code != remotev1.WarningCode_WARNING_CODE_MANAGEMENT_EXPIRING_SOON || got.Warnings[0].ManagedUntilUnixMs != deadline {
+		t.Fatalf("expiring codex=%+v", got)
+	}
+	record, err := m.Persistence.GetCodex(ctx, "c")
+	if err != nil || record.WarningDeadlineUnixMS != deadline || record.ManagementState != remotev1.ManagementState_MANAGEMENT_STATE_EXPIRING_SOON.String() {
+		t.Fatalf("persisted expiring record=%+v err=%v", record, err)
+	}
+	after := uint64(0)
+	w, err := m.Events.Watch(ctx, "c", &after, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(w.Replay) != 2 || w.Replay[0].GetCodexUpdated() == nil || w.Replay[1].GetWarningRaised().GetWarning().GetManagedUntilUnixMs() != deadline {
+		t.Fatalf("warning replay=%+v", w.Replay)
+	}
+	w.Cancel()
+
+	now = base.Add(2 * time.Hour)
+	if err := m.sweepLeases(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = m.lookup("c")
+	if got.ManagementState != remotev1.ManagementState_MANAGEMENT_STATE_UNMANAGED || got.ManagedUntilUnixMs != 0 {
+		t.Fatalf("expired idle codex=%+v", got)
+	}
+}
+
+func TestLeaseExpiryAndManualUnmanageRespectBusyState(t *testing.T) {
+	m := testManager(t)
+	ctx := context.Background()
+	now := time.Unix(1_800_000_000, 0)
+	m.Clock = func() time.Time { return now }
+	m.mu.Lock()
+	m.ensureMapsLocked()
+	m.byID["c"].Codex.ManagementState = remotev1.ManagementState_MANAGEMENT_STATE_MANAGED
+	m.byID["c"].Codex.ManagedUntilUnixMs = now.UnixMilli()
+	m.byID["c"].Codex.Status = remotev1.CodexStatus_CODEX_STATUS_RUNNING
+	m.byID["c"].Codex.ActiveTurnId = "turn"
+	m.byID["c"].ActiveTurn = &remotev1.TurnSnapshot{TurnId: "turn", Status: remotev1.TurnStatus_TURN_STATUS_RUNNING}
+	m.mu.Unlock()
+	if err := m.sweepLeases(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := m.lookup("c")
+	if got.ManagementState != remotev1.ManagementState_MANAGEMENT_STATE_EXPIRING_SOON || got.ManagedUntilUnixMs == 0 {
+		t.Fatalf("busy expiry codex=%+v", got)
+	}
+	if _, err := m.UnmanageCodex(ctx, &remotev1.UnmanageCodexRequest{CodexId: "c"}); err == nil {
+		t.Fatal("busy manual unmanage succeeded")
+	} else {
+		var rpc *gateway.RPCError
+		if !errors.As(err, &rpc) || rpc.Detail.Code != remotev1.ErrorCode_ERROR_CODE_CODEX_BUSY {
+			t.Fatalf("busy error=%v", err)
+		}
+	}
+	m.mu.Lock()
+	m.byID["c"].Codex.Status = remotev1.CodexStatus_CODEX_STATUS_IDLE
+	m.byID["c"].Codex.ActiveTurnId = ""
+	m.byID["c"].ActiveTurn = nil
+	m.mu.Unlock()
+	response, err := m.UnmanageCodex(ctx, &remotev1.UnmanageCodexRequest{CodexId: "c"})
+	if err != nil || response.Codex.ManagementState != remotev1.ManagementState_MANAGEMENT_STATE_UNMANAGED {
+		t.Fatalf("idle unmanage response=%+v err=%v", response, err)
+	}
+	response, err = m.UnmanageCodex(ctx, &remotev1.UnmanageCodexRequest{CodexId: "c"})
+	if err != nil || response.Codex.CodexId != "c" {
+		t.Fatalf("idempotent unmanage response=%+v err=%v", response, err)
+	}
+}
+
+const failFirstEventViewTrigger = `CREATE TRIGGER fail_first_lifecycle_event BEFORE UPDATE OF current_view_json ON codexes
+WHEN instr(CAST(NEW.current_view_json AS TEXT), '"headEventSeq":"1"') > 0
+BEGIN SELECT RAISE(ABORT, 'injected lifecycle event failure'); END`
+
+func TestLeaseWarningPublishFailureRollsBackAndRetriesOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	m, _ := testManagerAt(t, path)
+	ctx := context.Background()
+	base := time.Unix(1_800_000_000, 0)
+	deadline := base.Add(2 * time.Hour).UnixMilli()
+	m.Clock = func() time.Time { return base.Add(90 * time.Minute) }
+	m.LeaseWarningBefore = 30 * time.Minute
+	m.mu.Lock()
+	m.ensureMapsLocked()
+	m.byID["c"].Codex.ManagementState = remotev1.ManagementState_MANAGEMENT_STATE_MANAGED
+	m.byID["c"].Codex.ManagedUntilUnixMs = deadline
+	initial := proto.Clone(m.byID["c"]).(*remotev1.CurrentView)
+	m.mu.Unlock()
+	if err := m.persistState(ctx, initial); err != nil {
+		t.Fatal(err)
+	}
+	execSQLite(t, path, failFirstEventViewTrigger)
+	if err := m.sweepLeases(ctx); err == nil || !strings.Contains(err.Error(), "injected lifecycle event failure") {
+		t.Fatalf("sweep error=%v", err)
+	}
+	got, _ := m.lookup("c")
+	record, err := m.Persistence.GetCodex(ctx, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ManagementState != remotev1.ManagementState_MANAGEMENT_STATE_MANAGED || got.ManagedUntilUnixMs != deadline || len(got.Warnings) != 0 || record.WarningDeadlineUnixMS != 0 || record.ManagementState != remotev1.ManagementState_MANAGEMENT_STATE_MANAGED.String() {
+		t.Fatalf("failed warning was not rolled back: codex=%+v record=%+v", got, record)
+	}
+	reset, err := m.Events.Watch(ctx, "c", nil, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reset.Response.GetResetView().GetCodex().GetManagementState() != remotev1.ManagementState_MANAGEMENT_STATE_MANAGED || len(reset.Response.GetResetView().GetCodex().GetWarnings()) != 0 {
+		t.Fatalf("rollback RESET=%+v", reset.Response)
+	}
+	reset.Cancel()
+	execSQLite(t, path, `DROP TRIGGER fail_first_lifecycle_event`)
+	if err := m.sweepLeases(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.sweepLeases(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = m.lookup("c")
+	record, _ = m.Persistence.GetCodex(ctx, "c")
+	head, _ := m.Persistence.EventHead(ctx, "c")
+	if got.ManagementState != remotev1.ManagementState_MANAGEMENT_STATE_EXPIRING_SOON || len(got.Warnings) != 1 || record.WarningDeadlineUnixMS != deadline || head != 2 {
+		t.Fatalf("warning retry duplicated or was lost: codex=%+v record=%+v head=%d", got, record, head)
+	}
+}
+
+func TestLeaseWarningSecondPublishFailureKeepsTransitionAndRetriesWarning(t *testing.T) {
+	m := testManager(t)
+	ctx := context.Background()
+	base := time.Unix(1_800_000_000, 0)
+	deadline := base.Add(2 * time.Hour).UnixMilli()
+	m.Clock = func() time.Time { return base.Add(90 * time.Minute) }
+	m.LeaseWarningBefore = 30 * time.Minute
+	m.mu.Lock()
+	m.ensureMapsLocked()
+	m.byID["c"].Codex.ManagementState = remotev1.ManagementState_MANAGEMENT_STATE_MANAGED
+	m.byID["c"].Codex.ManagedUntilUnixMs = deadline
+	initial := proto.Clone(m.byID["c"]).(*remotev1.CurrentView)
+	m.mu.Unlock()
+	if err := m.persistState(ctx, initial); err != nil {
+		t.Fatal(err)
+	}
+	publishes := 0
+	m.testPublishEvent = func(ctx context.Context, event *remotev1.Event, view *remotev1.CurrentView, provenance *remotev1.Provenance, parent string) (*remotev1.Event, error) {
+		publishes++
+		if publishes == 2 {
+			return nil, errors.New("injected WarningRaised failure")
+		}
+		return m.Events.Publish(ctx, event, view, provenance, parent)
+	}
+	if err := m.sweepLeases(ctx); err == nil || !strings.Contains(err.Error(), "WarningRaised") {
+		t.Fatalf("warning failure=%v", err)
+	}
+	got, _ := m.lookup("c")
+	record, _ := m.Persistence.GetCodex(ctx, "c")
+	head, _ := m.Persistence.EventHead(ctx, "c")
+	if got.ManagementState != remotev1.ManagementState_MANAGEMENT_STATE_EXPIRING_SOON || len(got.Warnings) != 1 || record.WarningDeadlineUnixMS != 0 || head != 1 {
+		t.Fatalf("second publish failure state=%+v record=%+v head=%d", got, record, head)
+	}
+	m.testPublishEvent = nil
+	if err := m.sweepLeases(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.sweepLeases(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = m.lookup("c")
+	record, _ = m.Persistence.GetCodex(ctx, "c")
+	head, _ = m.Persistence.EventHead(ctx, "c")
+	if len(got.Warnings) != 1 || record.WarningDeadlineUnixMS != deadline || head != 3 {
+		t.Fatalf("warning retry state=%+v record=%+v head=%d", got, record, head)
+	}
+}
+
+func TestLeaseWarningUnknownOutcomesUseConservativeMarkers(t *testing.T) {
+	base := time.Unix(1_800_000_000, 0)
+	for _, failAt := range []int{1, 2} {
+		t.Run(fmt.Sprintf("publish_%d", failAt), func(t *testing.T) {
+			m := testManager(t)
+			ctx := context.Background()
+			deadline := base.Add(2 * time.Hour).UnixMilli()
+			m.Clock = func() time.Time { return base.Add(90 * time.Minute) }
+			m.LeaseWarningBefore = 30 * time.Minute
+			m.mu.Lock()
+			m.ensureMapsLocked()
+			m.byID["c"].Codex.ManagementState = remotev1.ManagementState_MANAGEMENT_STATE_MANAGED
+			m.byID["c"].Codex.ManagedUntilUnixMs = deadline
+			initial := proto.Clone(m.byID["c"]).(*remotev1.CurrentView)
+			m.mu.Unlock()
+			if err := m.persistState(ctx, initial); err != nil {
+				t.Fatal(err)
+			}
+			publishes := 0
+			m.testPublishEvent = func(ctx context.Context, event *remotev1.Event, view *remotev1.CurrentView, provenance *remotev1.Provenance, parent string) (*remotev1.Event, error) {
+				publishes++
+				if publishes == failAt {
+					return nil, persistence.ErrEventCommitOutcomeUnknown
+				}
+				return m.Events.Publish(ctx, event, view, provenance, parent)
+			}
+			if err := m.sweepLeases(ctx); !errors.Is(err, persistence.ErrEventCommitOutcomeUnknown) {
+				t.Fatalf("unknown outcome=%v", err)
+			}
+			got, _ := m.lookup("c")
+			record, _ := m.Persistence.GetCodex(ctx, "c")
+			if got.ManagementState != remotev1.ManagementState_MANAGEMENT_STATE_EXPIRING_SOON || len(got.Warnings) != 1 {
+				t.Fatalf("unknown warning state=%+v", got)
+			}
+			wantMarker := int64(0)
+			if failAt == 2 {
+				wantMarker = deadline
+			}
+			if record.WarningDeadlineUnixMS != wantMarker {
+				t.Fatalf("unknown marker=%d want=%d", record.WarningDeadlineUnixMS, wantMarker)
+			}
+			m.testPublishEvent = nil
+			if err := m.sweepLeases(ctx); failAt == 1 && err != nil {
+				t.Fatal(err)
+			}
+			got, _ = m.lookup("c")
+			if len(got.Warnings) != 1 {
+				t.Fatalf("unknown outcome duplicated warning=%+v", got.Warnings)
+			}
+			head, _ := m.Persistence.EventHead(ctx, "c")
+			if failAt == 1 && head != 2 {
+				t.Fatalf("first unknown did not retry both events: head=%d", head)
+			}
+			if failAt == 2 && head != 1 {
+				t.Fatalf("second unknown was retried: head=%d", head)
+			}
+		})
+	}
+}
+
+func TestLifecyclePublishFailureRollsBackManagementTransitions(t *testing.T) {
+	base := time.Unix(1_800_000_000, 0)
+	tests := []struct {
+		name      string
+		configure func(*Manager)
+		operation func(context.Context, *Manager) error
+		checkOld  func(*testing.T, *remotev1.Codex)
+		checkNew  func(*testing.T, *remotev1.Codex)
+	}{
+		{
+			name: "automatic unmanage",
+			configure: func(m *Manager) {
+				m.Clock = func() time.Time { return base.Add(2 * time.Hour) }
+			},
+			operation: func(ctx context.Context, m *Manager) error { return m.sweepLeases(ctx) },
+			checkOld: func(t *testing.T, c *remotev1.Codex) {
+				if c.ManagementState != remotev1.ManagementState_MANAGEMENT_STATE_MANAGED || c.ManagedUntilUnixMs != base.Add(2*time.Hour).UnixMilli() {
+					t.Fatalf("auto unmanage rollback=%+v", c)
+				}
+			},
+			checkNew: func(t *testing.T, c *remotev1.Codex) {
+				if c.ManagementState != remotev1.ManagementState_MANAGEMENT_STATE_UNMANAGED || c.ManagedUntilUnixMs != 0 {
+					t.Fatalf("auto unmanage retry=%+v", c)
+				}
+			},
+		},
+		{
+			name: "manual unmanage",
+			configure: func(m *Manager) {
+				m.Clock = func() time.Time { return base }
+			},
+			operation: func(ctx context.Context, m *Manager) error {
+				_, err := m.UnmanageCodex(ctx, &remotev1.UnmanageCodexRequest{CodexId: "c"})
+				return err
+			},
+			checkOld: func(t *testing.T, c *remotev1.Codex) {
+				if c.ManagementState != remotev1.ManagementState_MANAGEMENT_STATE_MANAGED {
+					t.Fatalf("manual unmanage rollback=%+v", c)
+				}
+			},
+			checkNew: func(t *testing.T, c *remotev1.Codex) {
+				if c.ManagementState != remotev1.ManagementState_MANAGEMENT_STATE_UNMANAGED {
+					t.Fatalf("manual unmanage retry=%+v", c)
+				}
+			},
+		},
+		{
+			name: "foreground renewal",
+			configure: func(m *Manager) {
+				m.Clock = func() time.Time { return base }
+			},
+			operation: func(ctx context.Context, m *Manager) error {
+				return m.RenewForegroundCodexes(ctx, []string{"c"})
+			},
+			checkOld: func(t *testing.T, c *remotev1.Codex) {
+				if c.ManagedUntilUnixMs != base.Add(2*time.Hour).UnixMilli() {
+					t.Fatalf("renew rollback=%+v", c)
+				}
+			},
+			checkNew: func(t *testing.T, c *remotev1.Codex) {
+				if c.ManagedUntilUnixMs != base.Add(3*time.Hour).UnixMilli() {
+					t.Fatalf("renew retry=%+v", c)
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "state.db")
+			m, _ := testManagerAt(t, path)
+			m.LeaseDuration = 3 * time.Hour
+			m.mu.Lock()
+			m.ensureMapsLocked()
+			m.byID["c"].Codex.ManagementState = remotev1.ManagementState_MANAGEMENT_STATE_MANAGED
+			m.byID["c"].Codex.ManagedUntilUnixMs = base.Add(2 * time.Hour).UnixMilli()
+			initial := proto.Clone(m.byID["c"]).(*remotev1.CurrentView)
+			m.mu.Unlock()
+			tt.configure(m)
+			if err := m.persistState(context.Background(), initial); err != nil {
+				t.Fatal(err)
+			}
+			execSQLite(t, path, failFirstEventViewTrigger)
+			if err := tt.operation(context.Background(), m); err == nil {
+				t.Fatal("injected publish failure was swallowed")
+			}
+			old, _ := m.lookup("c")
+			tt.checkOld(t, old)
+			record, _ := m.Persistence.GetCodex(context.Background(), "c")
+			if record.ManagementState != old.ManagementState.String() || record.ManagedUntilUnixMS != old.ManagedUntilUnixMs {
+				t.Fatalf("durable rollback differs: codex=%+v record=%+v", old, record)
+			}
+			execSQLite(t, path, `DROP TRIGGER fail_first_lifecycle_event`)
+			if err := tt.operation(context.Background(), m); err != nil {
+				t.Fatal(err)
+			}
+			updated, _ := m.lookup("c")
+			tt.checkNew(t, updated)
+		})
+	}
+}
+
+func TestSingleLifecycleEventUnknownKeepsNewState(t *testing.T) {
+	base := time.Unix(1_800_000_000, 0)
+	tests := []struct {
+		name      string
+		configure func(*Manager)
+		operation func(context.Context, *Manager) error
+		check     func(*testing.T, *remotev1.Codex)
+	}{
+		{name: "automatic unmanage", configure: func(m *Manager) { m.Clock = func() time.Time { return base.Add(2 * time.Hour) } }, operation: func(ctx context.Context, m *Manager) error { return m.sweepLeases(ctx) }, check: func(t *testing.T, c *remotev1.Codex) {
+			if c.ManagementState != remotev1.ManagementState_MANAGEMENT_STATE_UNMANAGED {
+				t.Fatalf("auto unknown=%+v", c)
+			}
+		}},
+		{name: "manual unmanage", configure: func(m *Manager) { m.Clock = func() time.Time { return base } }, operation: func(ctx context.Context, m *Manager) error {
+			_, err := m.UnmanageCodex(ctx, &remotev1.UnmanageCodexRequest{CodexId: "c"})
+			return err
+		}, check: func(t *testing.T, c *remotev1.Codex) {
+			if c.ManagementState != remotev1.ManagementState_MANAGEMENT_STATE_UNMANAGED {
+				t.Fatalf("manual unknown=%+v", c)
+			}
+		}},
+		{name: "foreground renewal", configure: func(m *Manager) { m.Clock = func() time.Time { return base } }, operation: func(ctx context.Context, m *Manager) error { return m.RenewForegroundCodexes(ctx, []string{"c"}) }, check: func(t *testing.T, c *remotev1.Codex) {
+			if c.ManagedUntilUnixMs != base.Add(3*time.Hour).UnixMilli() {
+				t.Fatalf("renew unknown=%+v", c)
+			}
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := testManager(t)
+			m.LeaseDuration = 3 * time.Hour
+			m.mu.Lock()
+			m.ensureMapsLocked()
+			m.byID["c"].Codex.ManagementState = remotev1.ManagementState_MANAGEMENT_STATE_MANAGED
+			m.byID["c"].Codex.ManagedUntilUnixMs = base.Add(2 * time.Hour).UnixMilli()
+			initial := proto.Clone(m.byID["c"]).(*remotev1.CurrentView)
+			m.mu.Unlock()
+			tt.configure(m)
+			if err := m.persistState(context.Background(), initial); err != nil {
+				t.Fatal(err)
+			}
+			m.testPublishEvent = func(context.Context, *remotev1.Event, *remotev1.CurrentView, *remotev1.Provenance, string) (*remotev1.Event, error) {
+				return nil, persistence.ErrEventCommitOutcomeUnknown
+			}
+			if err := tt.operation(context.Background(), m); !errors.Is(err, persistence.ErrEventCommitOutcomeUnknown) {
+				t.Fatalf("unknown outcome=%v", err)
+			}
+			got, _ := m.lookup("c")
+			tt.check(t, got)
+			record, _ := m.Persistence.GetCodex(context.Background(), "c")
+			if record.ManagementState != got.ManagementState.String() || record.ManagedUntilUnixMS != got.ManagedUntilUnixMs {
+				t.Fatalf("unknown durable state differs: codex=%+v record=%+v", got, record)
+			}
+		})
+	}
+}
+
+func TestLifecycleRollbackFailureIsReportedAsDegraded(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	m, _ := testManagerAt(t, path)
+	ctx := context.Background()
+	m.mu.Lock()
+	m.ensureMapsLocked()
+	m.byID["c"].Codex.ManagementState = remotev1.ManagementState_MANAGEMENT_STATE_MANAGED
+	m.byID["c"].Codex.ManagedUntilUnixMs = time.Now().Add(time.Hour).UnixMilli()
+	initial := proto.Clone(m.byID["c"]).(*remotev1.CurrentView)
+	m.mu.Unlock()
+	if err := m.persistState(ctx, initial); err != nil {
+		t.Fatal(err)
+	}
+	execSQLite(t, path, failFirstEventViewTrigger+`;
+CREATE TRIGGER fail_lifecycle_rollback BEFORE UPDATE OF current_view_json ON codexes
+WHEN instr(CAST(NEW.current_view_json AS TEXT), 'MANAGEMENT_STATE_MANAGED') > 0
+BEGIN SELECT RAISE(ABORT, 'injected rollback failure'); END`)
+	_, err := m.UnmanageCodex(ctx, &remotev1.UnmanageCodexRequest{CodexId: "c"})
+	if err == nil || !strings.Contains(err.Error(), "rollback lifecycle state") || !strings.Contains(err.Error(), "injected lifecycle event failure") || !strings.Contains(err.Error(), "injected rollback failure") {
+		t.Fatalf("combined rollback error=%v", err)
+	}
+	m.mu.RLock()
+	asyncError := m.asyncError
+	m.mu.RUnlock()
+	if !strings.Contains(asyncError, "rollback lifecycle state") {
+		t.Fatalf("async degradation=%q", asyncError)
+	}
+}
+
+func TestSetRunningPublishFailureKeepsHonestUpstreamState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	m, _ := testManagerAt(t, path)
+	ctx := context.Background()
+	base := time.Unix(1_800_000_000, 0)
+	m.Clock = func() time.Time { return base }
+	m.LeaseDuration = 2 * time.Hour
+	m.mu.Lock()
+	m.ensureMapsLocked()
+	m.byID["c"].Codex.ManagementState = remotev1.ManagementState_MANAGEMENT_STATE_UNMANAGED
+	m.byID["c"].Codex.ManagedUntilUnixMs = 0
+	initial := proto.Clone(m.byID["c"]).(*remotev1.CurrentView)
+	m.mu.Unlock()
+	if err := m.persistState(ctx, initial); err != nil {
+		t.Fatal(err)
+	}
+	execSQLite(t, path, failFirstEventViewTrigger)
+	if err := m.setRunning(ctx, "c", "turn", "request"); err == nil {
+		t.Fatal("setRunning publish failure was swallowed")
+	}
+	got, _ := m.lookup("c")
+	record, err := m.Persistence.GetCodex(ctx, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDeadline := base.Add(2 * time.Hour).UnixMilli()
+	if got.Status != remotev1.CodexStatus_CODEX_STATUS_RUNNING || got.ActiveTurnId != "turn" || got.ManagementState != remotev1.ManagementState_MANAGEMENT_STATE_MANAGED || got.ManagedUntilUnixMs != wantDeadline || record.Status != remotev1.CodexStatus_CODEX_STATUS_RUNNING.String() || record.ManagedUntilUnixMS != wantDeadline {
+		t.Fatalf("successful upstream turn was rolled back: codex=%+v record=%+v", got, record)
+	}
+	m.mu.RLock()
+	asyncError := m.asyncError
+	m.mu.RUnlock()
+	if !strings.Contains(asyncError, "injected lifecycle event failure") {
+		t.Fatalf("setRunning degradation=%q", asyncError)
+	}
+	reset, err := m.Events.Watch(ctx, "c", nil, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reset.Response.GetResetView().GetCodex().GetStatus() != remotev1.CodexStatus_CODEX_STATUS_RUNNING || reset.Response.GetResetView().GetCodex().GetActiveTurnId() != "turn" {
+		t.Fatalf("setRunning failure RESET=%+v", reset.Response)
+	}
+	reset.Cancel()
+}
+
+func TestUnmanagedStartTurnPersistFailureKeepsRunningMemory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	m, _ := testManagerAt(t, path)
+	m.Runtime = fixedAdapterRuntime{adapter: restoreTestAdapter(t)}
+	base := time.Unix(1_800_000_000, 0)
+	m.Clock = func() time.Time { return base }
+	m.mu.Lock()
+	m.ensureMapsLocked()
+	m.byID["c"].Codex.ManagementState = remotev1.ManagementState_MANAGEMENT_STATE_UNMANAGED
+	m.byID["c"].Codex.ManagedUntilUnixMs = 0
+	initial := proto.Clone(m.byID["c"]).(*remotev1.CurrentView)
+	m.mu.Unlock()
+	if err := m.persistState(context.Background(), initial); err != nil {
+		t.Fatal(err)
+	}
+	execSQLite(t, path, `CREATE TRIGGER fail_start_running_persist BEFORE UPDATE OF current_view_json ON codexes BEGIN SELECT RAISE(ABORT, 'injected running persist failure'); END`)
+	if _, err := m.StartTurn(context.Background(), &remotev1.StartTurnRequest{CodexId: "c"}); err == nil || !strings.Contains(err.Error(), "running persist failure") {
+		t.Fatalf("StartTurn persist failure=%v", err)
+	}
+	got, _ := m.lookup("c")
+	if got.Status != remotev1.CodexStatus_CODEX_STATUS_RUNNING || got.ActiveTurnId != "turn" || got.ManagementState != remotev1.ManagementState_MANAGEMENT_STATE_MANAGED || got.ManagedUntilUnixMs != base.Add(2*time.Hour).UnixMilli() {
+		t.Fatalf("upstream turn missing from memory=%+v", got)
+	}
+	m.mu.RLock()
+	asyncError := m.asyncError
+	m.mu.RUnlock()
+	if !strings.Contains(asyncError, "running persist failure") {
+		t.Fatalf("persist degradation=%q", asyncError)
+	}
+	record, _ := m.Persistence.GetCodex(context.Background(), "c")
+	if record.ManagementState != remotev1.ManagementState_MANAGEMENT_STATE_UNMANAGED.String() {
+		t.Fatalf("failed persistence unexpectedly changed durable state=%+v", record)
+	}
+}
+
+func TestManualUnmanageBusyAndAutomaticSafety(t *testing.T) {
+	tests := []struct {
+		name       string
+		view       *remotev1.CurrentView
+		manualBusy bool
+		autoSafe   bool
+	}{
+		{name: "nil view"},
+		{name: "idle", view: &remotev1.CurrentView{Codex: &remotev1.Codex{Status: remotev1.CodexStatus_CODEX_STATUS_IDLE}}, autoSafe: true},
+		{name: "active id", view: &remotev1.CurrentView{Codex: &remotev1.Codex{Status: remotev1.CodexStatus_CODEX_STATUS_IDLE, ActiveTurnId: "turn"}}, manualBusy: true},
+		{name: "active turn", view: &remotev1.CurrentView{Codex: &remotev1.Codex{Status: remotev1.CodexStatus_CODEX_STATUS_IDLE}, ActiveTurn: &remotev1.TurnSnapshot{TurnId: "turn"}}, manualBusy: true},
+		{name: "approval pending", view: &remotev1.CurrentView{Codex: &remotev1.Codex{Status: remotev1.CodexStatus_CODEX_STATUS_IDLE}, PendingRequests: []*remotev1.PendingRequest{{Request: &remotev1.PendingRequest_Approval{Approval: &remotev1.Approval{ApprovalId: "a"}}}}}, manualBusy: true},
+		{name: "user input pending", view: &remotev1.CurrentView{Codex: &remotev1.Codex{Status: remotev1.CodexStatus_CODEX_STATUS_IDLE}, PendingRequests: []*remotev1.PendingRequest{{Request: &remotev1.PendingRequest_UserInput{UserInput: &remotev1.UserInputRequestState{UserInputRequestId: "u"}}}}}, manualBusy: true},
+		{name: "running", view: &remotev1.CurrentView{Codex: &remotev1.Codex{Status: remotev1.CodexStatus_CODEX_STATUS_RUNNING}}, manualBusy: true},
+		{name: "waiting approval", view: &remotev1.CurrentView{Codex: &remotev1.Codex{Status: remotev1.CodexStatus_CODEX_STATUS_WAITING_FOR_APPROVAL}}, manualBusy: true},
+		{name: "waiting input", view: &remotev1.CurrentView{Codex: &remotev1.Codex{Status: remotev1.CodexStatus_CODEX_STATUS_WAITING_FOR_USER_INPUT}}, manualBusy: true},
+		{name: "interrupting", view: &remotev1.CurrentView{Codex: &remotev1.Codex{Status: remotev1.CodexStatus_CODEX_STATUS_INTERRUPTING}}, manualBusy: true},
+		{name: "error", view: &remotev1.CurrentView{Codex: &remotev1.Codex{Status: remotev1.CodexStatus_CODEX_STATUS_ERROR}}},
+		{name: "unavailable", view: &remotev1.CurrentView{Codex: &remotev1.Codex{Status: remotev1.CodexStatus_CODEX_STATUS_UNAVAILABLE}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := manualUnmanageBusy(tt.view); got != tt.manualBusy {
+				t.Fatalf("manualUnmanageBusy=%v, want %v", got, tt.manualBusy)
+			}
+			if got := automaticUnmanageSafe(tt.view); got != tt.autoSafe {
+				t.Fatalf("automaticUnmanageSafe=%v, want %v", got, tt.autoSafe)
+			}
+		})
+	}
+}
+
+func TestForegroundRenewalAndStartRunningManagementRules(t *testing.T) {
+	m := testManager(t)
+	ctx := context.Background()
+	now := time.Unix(1_800_000_000, 0)
+	m.Clock = func() time.Time { return now }
+	m.LeaseDuration = 2 * time.Hour
+	m.mu.Lock()
+	m.ensureMapsLocked()
+	m.byID["c"].Codex.ManagementState = remotev1.ManagementState_MANAGEMENT_STATE_EXPIRING_SOON
+	m.byID["c"].Codex.ManagedUntilUnixMs = now.Add(time.Minute).UnixMilli()
+	m.warningDeadline["c"] = m.byID["c"].Codex.ManagedUntilUnixMs
+	m.mu.Unlock()
+	if err := m.RenewForegroundCodexes(ctx, []string{"missing", "c", "c"}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := m.lookup("c")
+	if got.ManagementState != remotev1.ManagementState_MANAGEMENT_STATE_MANAGED || got.ManagedUntilUnixMs != now.Add(2*time.Hour).UnixMilli() {
+		t.Fatalf("foreground renewed codex=%+v", got)
+	}
+	m.mu.Lock()
+	m.byID["c"].Codex.ManagementState = remotev1.ManagementState_MANAGEMENT_STATE_UNMANAGED
+	m.byID["c"].Codex.ManagedUntilUnixMs = 0
+	m.byID["c"].Codex.Status = remotev1.CodexStatus_CODEX_STATUS_IDLE
+	m.mu.Unlock()
+	now = now.Add(time.Hour)
+	if err := m.RenewForegroundCodexes(ctx, []string{"c"}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = m.lookup("c")
+	if got.ManagementState != remotev1.ManagementState_MANAGEMENT_STATE_UNMANAGED {
+		t.Fatalf("foreground restored unmanaged codex=%+v", got)
+	}
+	if err := m.setRunning(ctx, "c", "turn", "request"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = m.lookup("c")
+	if got.ManagementState != remotev1.ManagementState_MANAGEMENT_STATE_MANAGED || got.ManagedUntilUnixMs != now.Add(2*time.Hour).UnixMilli() || got.CodexId != "c" {
+		t.Fatalf("StartTurn acceptance management=%+v", got)
 	}
 }
 
@@ -360,6 +1133,196 @@ func TestRestartPendingIsClearedWithHonestCompleteness(t *testing.T) {
 	m.noteUnrecoverablePending(context.Background(), "c", view)
 	if len(view.PendingRequests) != 0 || view.Completeness == nil || !view.Completeness.Incomplete || len(view.Codex.Warnings) != 1 {
 		t.Fatalf("restart view %+v", view)
+	}
+}
+
+func TestRestartPreservesLeaseWarningWithoutRepublishing(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "state.db")
+	first, err := persistence.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Unix(1_800_000_000, 0)
+	deadline := base.Add(2 * time.Hour).UnixMilli()
+	persisted := &remotev1.CurrentView{
+		Codex: &remotev1.Codex{
+			CodexId:              "c",
+			ThreadId:             "thread",
+			Cwd:                  "/tmp",
+			Origin:               remotev1.CodexOrigin_CODEX_ORIGIN_REMOTE_CREATED,
+			Status:               remotev1.CodexStatus_CODEX_STATUS_RUNNING,
+			ActiveTurnId:         "lost-turn",
+			ManagementState:      remotev1.ManagementState_MANAGEMENT_STATE_MANAGED,
+			ManagedUntilUnixMs:   deadline,
+			CreatedAtUnixMs:      base.UnixMilli(),
+			LastActivityAtUnixMs: base.UnixMilli(),
+		},
+		ActiveTurn:   &remotev1.TurnSnapshot{TurnId: "lost-turn", Status: remotev1.TurnStatus_TURN_STATUS_RUNNING},
+		Completeness: &remotev1.Completeness{Incomplete: true, Reason: "persisted diagnostic"},
+	}
+	raw, err := protojson.Marshal(persisted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := recordFromCodex(persisted.Codex, "cli")
+	record.CurrentViewJSON = raw
+	if err := first.UpsertCodex(ctx, record); err != nil {
+		t.Fatal(err)
+	}
+	beforeRestart := &Manager{
+		Persistence:        first,
+		Events:             activity.NewStore(first, nil, 16),
+		Clock:              func() time.Time { return base.Add(90 * time.Minute) },
+		LeaseWarningBefore: 30 * time.Minute,
+	}
+	beforeRestart.registerRestored(record, persisted)
+	if err := beforeRestart.sweepLeases(ctx); err != nil {
+		t.Fatal(err)
+	}
+	head, err := first.EventHead(ctx, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head != 2 {
+		t.Fatalf("initial warning events head=%d, want 2", head)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := persistence.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { reopened.Close() })
+	record, err = reopened.GetCodex(ctx, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{Persistence: reopened, Clock: func() time.Time { return base.Add(90 * time.Minute) }}
+	restoredCodex := codexFromRecord(record)
+	restoredCodex.Status = remotev1.CodexStatus_CODEX_STATUS_IDLE
+	restoredCodex.ActiveTurnId = ""
+	restored := &remotev1.CurrentView{Codex: restoredCodex, GeneratedAtUnixMs: m.now().UnixMilli()}
+	m.noteUnrecoverablePending(ctx, "c", restored)
+	m.registerRestored(record, restored)
+
+	if restored.ActiveTurn != nil || len(restored.PendingRequests) != 0 || restored.Codex.ActiveTurnId != "" {
+		t.Fatalf("runtime state was unexpectedly restored: %+v", restored)
+	}
+	if len(restored.Codex.Warnings) != 1 || restored.Codex.Warnings[0].Code != remotev1.WarningCode_WARNING_CODE_MANAGEMENT_EXPIRING_SOON || restored.Codex.Warnings[0].ManagedUntilUnixMs != deadline {
+		t.Fatalf("restored warnings=%+v", restored.Codex.Warnings)
+	}
+	if restored.Completeness == nil || !restored.Completeness.Incomplete || restored.Completeness.Reason != "persisted diagnostic" {
+		t.Fatalf("restored completeness=%+v", restored.Completeness)
+	}
+	if err := m.sweepLeases(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := m.lookup("c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Warnings) != 1 {
+		t.Fatalf("warning was republished after restart: %+v", got.Warnings)
+	}
+	head, err = reopened.EventHead(ctx, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head != 2 {
+		t.Fatalf("restart republished lifecycle events: head=%d", head)
+	}
+}
+
+func TestRestoreSerializesConcurrentLifecycleCommits(t *testing.T) {
+	ad := restoreTestAdapter(t)
+	base := time.Unix(1_800_000_000, 0)
+	tests := []struct {
+		name      string
+		operation func(context.Context, *Manager) error
+		check     func(*testing.T, *remotev1.Codex, persistence.CodexRecord)
+	}{
+		{
+			name: "manual unmanage",
+			operation: func(ctx context.Context, m *Manager) error {
+				_, err := m.UnmanageCodex(ctx, &remotev1.UnmanageCodexRequest{CodexId: "c"})
+				return err
+			},
+			check: func(t *testing.T, codex *remotev1.Codex, record persistence.CodexRecord) {
+				t.Helper()
+				if codex.ManagementState != remotev1.ManagementState_MANAGEMENT_STATE_UNMANAGED || record.ManagementState != remotev1.ManagementState_MANAGEMENT_STATE_UNMANAGED.String() {
+					t.Fatalf("unmanage was overwritten: codex=%+v record=%+v", codex, record)
+				}
+			},
+		},
+		{
+			name: "foreground renewal",
+			operation: func(ctx context.Context, m *Manager) error {
+				return m.RenewForegroundCodexes(ctx, []string{"c"})
+			},
+			check: func(t *testing.T, codex *remotev1.Codex, record persistence.CodexRecord) {
+				t.Helper()
+				want := base.Add(2 * time.Hour).UnixMilli()
+				if codex.ManagementState != remotev1.ManagementState_MANAGEMENT_STATE_MANAGED || codex.ManagedUntilUnixMs != want || record.ManagedUntilUnixMS != want {
+					t.Fatalf("renewal was overwritten: codex=%+v record=%+v", codex, record)
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := testManager(t)
+			m.Runtime = fixedAdapterRuntime{adapter: ad}
+			m.Clock = func() time.Time { return base }
+			m.LeaseDuration = 2 * time.Hour
+			m.mu.Lock()
+			m.ensureMapsLocked()
+			m.byID["c"].Codex.ManagementState = remotev1.ManagementState_MANAGEMENT_STATE_MANAGED
+			m.byID["c"].Codex.ManagedUntilUnixMs = base.Add(time.Hour).UnixMilli()
+			initial := proto.Clone(m.byID["c"]).(*remotev1.CurrentView)
+			m.mu.Unlock()
+			if err := m.persistState(context.Background(), initial); err != nil {
+				t.Fatal(err)
+			}
+
+			restorePaused := make(chan struct{})
+			restoreContinue := make(chan struct{})
+			m.testBeforeCommit = func(operation string) {
+				if operation == "restore" {
+					close(restorePaused)
+					<-restoreContinue
+				}
+			}
+			restoreDone := make(chan error, 1)
+			go func() { restoreDone <- m.Restore(context.Background()) }()
+			<-restorePaused
+			if m.commitMu.TryLock() {
+				m.commitMu.Unlock()
+				close(restoreContinue)
+				<-restoreDone
+				t.Fatal("Restore did not hold the state commit boundary while paused")
+			}
+			operationDone := make(chan error, 1)
+			go func() { operationDone <- tt.operation(context.Background(), m) }()
+			close(restoreContinue)
+			if err := <-restoreDone; err != nil {
+				t.Fatal(err)
+			}
+			if err := <-operationDone; err != nil {
+				t.Fatal(err)
+			}
+			codex, err := m.lookup("c")
+			if err != nil {
+				t.Fatal(err)
+			}
+			record, err := m.Persistence.GetCodex(context.Background(), "c")
+			if err != nil {
+				t.Fatal(err)
+			}
+			tt.check(t, codex, record)
+		})
 	}
 }
 

@@ -62,7 +62,7 @@ func status(resp *http.Response) any {
 	return resp.StatusCode
 }
 
-func TestHandshakeV10AndGetHost(t *testing.T) {
+func TestHandshakeV11AndGetHost(t *testing.T) {
 	c := dial(t)
 	hello := c.hello(t)
 	resp := c.request(t, &remotev1.Request{RequestId: "get-host", Request: &remotev1.Request_GetHost{GetHost: &remotev1.GetHostRequest{}}})
@@ -75,12 +75,24 @@ func TestHandshakeV10AndGetHost(t *testing.T) {
 	}
 }
 
-func TestHandshakeRejectsUnsupportedMinor(t *testing.T) {
-	c := dial(t)
-	c.writeFrame(t, &remotev1.Frame{Payload: &remotev1.Frame_ClientHello{ClientHello: &remotev1.ClientHello{ClientId: "bad-minor", ClientRunId: "run", ProtocolVersion: &remotev1.ProtocolVersion{Major: 1, Minor: 1}}}})
-	f := c.readUntil(t, func(f *remotev1.Frame) bool { return f.GetClose() != nil })
-	if f.GetClose().Code != remotev1.CloseCode_CLOSE_CODE_PROTOCOL_VERSION_UNSUPPORTED {
-		t.Fatalf("close code=%v", f.GetClose().Code)
+func TestHandshakeRejectsUnsupportedMinors(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		minor uint32
+	}{
+		{name: "old-1.0", minor: 0},
+		{name: "future-1.2", minor: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := dial(t)
+			c.writeFrame(t, &remotev1.Frame{Payload: &remotev1.Frame_ClientHello{ClientHello: &remotev1.ClientHello{
+				ClientId: "bad-minor", ClientRunId: "run", ProtocolVersion: &remotev1.ProtocolVersion{Major: 1, Minor: tc.minor},
+			}}})
+			f := c.readUntil(t, func(f *remotev1.Frame) bool { return f.GetClose() != nil })
+			if f.GetClose().Code != remotev1.CloseCode_CLOSE_CODE_PROTOCOL_VERSION_UNSUPPORTED {
+				t.Fatalf("minor=%d close code=%v, want PROTOCOL_VERSION_UNSUPPORTED", tc.minor, f.GetClose().Code)
+			}
+		})
 	}
 }
 

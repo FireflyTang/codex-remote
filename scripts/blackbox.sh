@@ -33,6 +33,9 @@ start_host() {
   local watch_queue=16
   local connection_timeout=2s
   local replay_capacity=32
+  local lease_duration=2h
+  local lease_warning_before=30m
+  local lease_sweep_interval=1m
   if [[ "${scenario}" == "large" || "${scenario}" == "multi-large" || "${scenario}" == "early-large" ]]; then
     max_frame_bytes=$((64 * 1024))
   elif [[ "${scenario}" == "burst" ]]; then
@@ -40,6 +43,14 @@ start_host() {
     watch_queue=8
     connection_timeout=30s
     replay_capacity=1024
+  elif [[ "${scenario}" == "lifecycle" ]]; then
+    lease_duration=2s
+    lease_warning_before=500ms
+    lease_sweep_interval=25ms
+  elif [[ "${scenario}" == "restart" ]]; then
+    lease_duration=3s
+    lease_warning_before=750ms
+    lease_sweep_interval=25ms
   fi
   "${repo_dir}/.tools/bin/codex-remote-host" \
     --dev-listen 127.0.0.1:0 \
@@ -56,6 +67,9 @@ start_host() {
     --watch-queue "${watch_queue}" \
     --max-frame-bytes "${max_frame_bytes}" \
     --replay-capacity "${replay_capacity}" \
+    --lease-duration "${lease_duration}" \
+    --lease-warning-before "${lease_warning_before}" \
+    --lease-sweep-interval "${lease_sweep_interval}" \
     --max-page-size 3 \
     >"${log_file}" 2>&1 &
   host_pid=$!
@@ -98,7 +112,7 @@ stop_host() {
 }
 
 result=0
-scenario_list="${CODEX_REMOTE_BLACKBOX_SCENARIOS:-normal interrupt approval user-input sessions unmaterialized-history structured failed rewatch synthetic-upsert early-large large multi-large burst audit-failure runtime-disconnect}"
+scenario_list="${CODEX_REMOTE_BLACKBOX_SCENARIOS:-normal workspace interrupt approval user-input sessions unmaterialized-history lifecycle structured failed rewatch synthetic-upsert early-large large multi-large burst audit-failure runtime-disconnect}"
 for scenario in ${scenario_list}; do
   start_host "${scenario}"
   run_pattern='.'
@@ -112,6 +126,10 @@ for scenario in ${scenario_list}; do
     run_pattern='^Test(DiscoverImportAndContinueUnmanagedSession|PageTokensAreBoundToOperationAndNormalizedQuery)$'
   elif [[ "${scenario}" == "unmaterialized-history" ]]; then
     run_pattern='^TestUnmaterializedCreatedThreadHasEmptyHistoryUntilFirstUserMessage$'
+  elif [[ "${scenario}" == "lifecycle" ]]; then
+    run_pattern='^Test(ManagementLifecycleOverFormalWire|HandshakeV11AndGetHost|HandshakeRejectsUnsupportedMinors)$'
+  elif [[ "${scenario}" == "workspace" ]]; then
+    run_pattern='^TestWorkspaceFormalWireScenario$'
   elif [[ "${scenario}" == "structured" ]]; then
     run_pattern='^TestStructuredItemsDeltasAndHistory$'
   elif [[ "${scenario}" == "failed" ]]; then

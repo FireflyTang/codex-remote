@@ -242,8 +242,28 @@ func (f *fixture) emitTurn(write func(any), threadID, turnID string) {
 		write(map[string]any{"jsonrpc": "2.0", "method": "turn/completed", "params": map[string]any{"threadId": threadID, "turn": turn}})
 	}
 	finish := func() { finishStatus("completed", nil) }
+	if f.scenario == "lifecycle" {
+		switch filepath.Base(f.threadCWD(threadID)) {
+		case "lifecycle-running":
+			return
+		case "lifecycle-pending":
+			f.setPending(`"lifecycle-approval-rpc"`, finish)
+			write(map[string]any{
+				"jsonrpc": "2.0", "id": "lifecycle-approval-rpc", "method": "item/commandExecution/requestApproval",
+				"params": map[string]any{
+					"approvalId": "lifecycle-approval", "threadId": threadID, "turnId": turnID,
+					"itemId": "lifecycle-command", "command": []string{"printf", "pending"},
+					"reason": "hold pending for lifecycle black-box coverage",
+				},
+			})
+			return
+		}
+	}
 	switch f.scenario {
 	case "interrupt":
+		return
+	case "workspace":
+		f.emitWorkspaceSubagents(write, threadID, turnID)
 		return
 	case "approval":
 		f.setPending(`"approval-rpc-1"`, finish)
@@ -293,6 +313,43 @@ func (f *fixture) emitTurn(write func(any), threadID, turnID string) {
 		write(map[string]any{"jsonrpc": "2.0", "method": "item/agentMessage/delta", "params": map[string]any{"threadId": threadID, "turnId": turnID, "itemId": "item-agent", "delta": "deterministic output"}})
 	}
 	finish()
+}
+
+func (f *fixture) emitWorkspaceSubagents(write func(any), threadID, turnID string) {
+	// Let the accepted parent turn publish its own workspace transition first.
+	// The item bodies below follow the official app-server V2
+	// collabAgentToolCall camelCase schema.
+	time.Sleep(250 * time.Millisecond)
+	const childA = "00000000-0000-0000-0000-0000000000a1"
+	const childB = "00000000-0000-0000-0000-0000000000b2"
+	item := func(id string, states map[string]any) map[string]any {
+		return map[string]any{
+			"id": id, "type": "collabAgentToolCall", "tool": "wait", "status": "completed",
+			"senderThreadId": threadID, "receiverThreadIds": []string{childA, childB}, "agentsStates": states,
+		}
+	}
+	notify := func(value map[string]any) {
+		write(map[string]any{"jsonrpc": "2.0", "method": "item/completed", "params": map[string]any{"threadId": threadID, "turnId": turnID, "item": value}})
+	}
+	running := item("workspace-collab-register", map[string]any{
+		childA: map[string]any{"status": "running"},
+		childB: map[string]any{"status": "running"},
+	})
+	notify(running)
+	notify(running) // exact duplicate must not double-count either receiver
+	time.Sleep(25 * time.Millisecond)
+	notify(item("workspace-collab-one-terminal", map[string]any{
+		childA: map[string]any{"status": "completed", "message": "child A done"},
+		childB: map[string]any{"status": "running"},
+	}))
+	notify(running) // stale out-of-order snapshot must not reactivate child A
+	time.Sleep(25 * time.Millisecond)
+	terminal := item("workspace-collab-both-terminal", map[string]any{
+		childA: map[string]any{"status": "completed", "message": "child A done"},
+		childB: map[string]any{"status": "interrupted", "message": "child B stopped"},
+	})
+	notify(terminal)
+	notify(terminal) // duplicate terminal snapshot must not decrement twice
 }
 
 func (f *fixture) updateTurn(threadID, turnID, status string) {
@@ -397,14 +454,41 @@ func (f *fixture) markDisrupted() bool {
 	return true
 }
 
+func (f *fixture) threadCWD(threadID string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if thread := f.threads[threadID]; thread != nil {
+		return fmt.Sprint(thread["cwd"])
+	}
+	return ""
+}
+
 func (f *fixture) seedScenario() {
-	if f.scenario != "sessions" || len(f.threads) != 0 {
+	if len(f.threads) != 0 {
 		return
 	}
 	workspace := filepath.Join(filepath.Dir(f.stateFile), "workspace")
 	now := time.Now().Unix()
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.scenario == "lifecycle" {
+		id := "lifecycle-import-thread"
+		cwd := filepath.Join(workspace, "lifecycle-import")
+		if err := os.MkdirAll(cwd, 0o700); err != nil {
+			log.Fatalf("seed lifecycle import workspace: %v", err)
+		}
+		f.threads[id] = map[string]any{
+			"id": id, "sessionId": id, "cwd": cwd,
+			"name": "lifecycle import candidate", "preview": "unmanaged lifecycle session",
+			"createdAt": now - 100, "updatedAt": now, "source": "exec", "status": "idle", "turns": []any{},
+		}
+		f.next = 1
+		_ = f.persistLocked()
+		return
+	}
+	if f.scenario != "sessions" {
+		return
+	}
 	for i, cwd := range []string{
 		filepath.Join(workspace, "unmanaged"),
 		filepath.Join(workspace, "unmanaged"),

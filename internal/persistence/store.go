@@ -21,9 +21,9 @@ var ErrEventCommitOutcomeUnknown = errors.New("event transaction commit outcome 
 type Store struct{ db *sql.DB }
 
 type CodexRecord struct {
-	CodexID, ThreadID, SessionSource, CWD, Title, Origin, Status, ActiveTurnID, RuntimeVersion string
-	CreatedAtUnixMS, ImportedAtUnixMS, LastActivityAtUnixMS                                    int64
-	CurrentViewJSON                                                                            []byte
+	CodexID, ThreadID, SessionSource, CWD, Title, Origin, Status, ActiveTurnID, RuntimeVersion, ManagementState string
+	CreatedAtUnixMS, ImportedAtUnixMS, LastActivityAtUnixMS, ManagedUntilUnixMS, WarningDeadlineUnixMS          int64
+	CurrentViewJSON                                                                                             []byte
 }
 
 type DedupState int
@@ -72,6 +72,8 @@ CREATE TABLE IF NOT EXISTS codexes (
  active_turn_id TEXT NOT NULL DEFAULT '', runtime_version TEXT NOT NULL DEFAULT '',
  created_at_ms INTEGER NOT NULL, imported_at_ms INTEGER NOT NULL DEFAULT 0,
  last_activity_at_ms INTEGER NOT NULL, current_view_json BLOB,
+ management_state TEXT NOT NULL DEFAULT '', managed_until_ms INTEGER NOT NULL DEFAULT 0,
+ management_warning_deadline_ms INTEGER NOT NULL DEFAULT 0,
  UNIQUE(session_source, thread_id)
 );
 CREATE INDEX IF NOT EXISTS codexes_activity ON codexes(last_activity_at_ms DESC, codex_id);
@@ -91,7 +93,10 @@ CREATE TABLE IF NOT EXISTS resolved_pending (
 	if err != nil {
 		return err
 	}
-	return s.ensureSessionSourceIdentity(ctx)
+	if err := s.ensureSessionSourceIdentity(ctx); err != nil {
+		return err
+	}
+	return s.ensureLifecycleColumns(ctx)
 }
 
 // ensureSessionSourceIdentity upgrades the original V1 schema, whose global
@@ -144,6 +149,8 @@ func (s *Store) ensureSessionSourceIdentity(ctx context.Context) error {
  active_turn_id TEXT NOT NULL DEFAULT '', runtime_version TEXT NOT NULL DEFAULT '',
  created_at_ms INTEGER NOT NULL, imported_at_ms INTEGER NOT NULL DEFAULT 0,
  last_activity_at_ms INTEGER NOT NULL, current_view_json BLOB,
+ management_state TEXT NOT NULL DEFAULT '', managed_until_ms INTEGER NOT NULL DEFAULT 0,
+ management_warning_deadline_ms INTEGER NOT NULL DEFAULT 0,
  UNIQUE(session_source,thread_id)
 )`); err != nil {
 		return err
@@ -159,6 +166,39 @@ func (s *Store) ensureSessionSourceIdentity(ctx context.Context) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+func (s *Store) ensureLifecycleColumns(ctx context.Context) error {
+	columns := map[string]bool{}
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(codexes)`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, typ string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		columns[name] = true
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, migration := range []struct{ name, sql string }{
+		{"management_state", `ALTER TABLE codexes ADD COLUMN management_state TEXT NOT NULL DEFAULT ''`},
+		{"managed_until_ms", `ALTER TABLE codexes ADD COLUMN managed_until_ms INTEGER NOT NULL DEFAULT 0`},
+		{"management_warning_deadline_ms", `ALTER TABLE codexes ADD COLUMN management_warning_deadline_ms INTEGER NOT NULL DEFAULT 0`},
+	} {
+		if !columns[migration.name] {
+			if _, err := s.db.ExecContext(ctx, migration.sql); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // BeginRequest reserves a side-effect before execution. An existing
@@ -213,22 +253,24 @@ func (s *Store) CompleteRequest(ctx context.Context, requestID string, responseJ
 }
 
 func (s *Store) UpsertCodex(ctx context.Context, r CodexRecord) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO codexes(codex_id,thread_id,session_source,cwd,title,origin,status,active_turn_id,runtime_version,created_at_ms,imported_at_ms,last_activity_at_ms,current_view_json)
-	 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(codex_id) DO UPDATE SET thread_id=excluded.thread_id,session_source=excluded.session_source,cwd=excluded.cwd,title=excluded.title,origin=excluded.origin,status=excluded.status,active_turn_id=excluded.active_turn_id,runtime_version=excluded.runtime_version,imported_at_ms=excluded.imported_at_ms,last_activity_at_ms=excluded.last_activity_at_ms,current_view_json=excluded.current_view_json`,
-		r.CodexID, r.ThreadID, normalizeSessionSource(r.SessionSource), r.CWD, r.Title, r.Origin, r.Status, r.ActiveTurnID, r.RuntimeVersion, r.CreatedAtUnixMS, r.ImportedAtUnixMS, r.LastActivityAtUnixMS, nullableBytes(r.CurrentViewJSON))
+	_, err := s.db.ExecContext(ctx, `INSERT INTO codexes(codex_id,thread_id,session_source,cwd,title,origin,status,active_turn_id,runtime_version,created_at_ms,imported_at_ms,last_activity_at_ms,current_view_json,management_state,managed_until_ms,management_warning_deadline_ms)
+	 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(codex_id) DO UPDATE SET thread_id=excluded.thread_id,session_source=excluded.session_source,cwd=excluded.cwd,title=excluded.title,origin=excluded.origin,status=excluded.status,active_turn_id=excluded.active_turn_id,runtime_version=excluded.runtime_version,imported_at_ms=excluded.imported_at_ms,last_activity_at_ms=excluded.last_activity_at_ms,current_view_json=excluded.current_view_json,management_state=excluded.management_state,managed_until_ms=excluded.managed_until_ms,management_warning_deadline_ms=excluded.management_warning_deadline_ms`,
+		r.CodexID, r.ThreadID, normalizeSessionSource(r.SessionSource), r.CWD, r.Title, r.Origin, r.Status, r.ActiveTurnID, r.RuntimeVersion, r.CreatedAtUnixMS, r.ImportedAtUnixMS, r.LastActivityAtUnixMS, nullableBytes(r.CurrentViewJSON), r.ManagementState, r.ManagedUntilUnixMS, r.WarningDeadlineUnixMS)
 	return err
 }
 
+const codexSelectColumns = `codex_id,thread_id,session_source,cwd,title,origin,status,active_turn_id,runtime_version,created_at_ms,imported_at_ms,last_activity_at_ms,current_view_json,management_state,managed_until_ms,management_warning_deadline_ms`
+
 func (s *Store) GetCodex(ctx context.Context, id string) (CodexRecord, error) {
-	return s.getCodex(ctx, `SELECT codex_id,thread_id,session_source,cwd,title,origin,status,active_turn_id,runtime_version,created_at_ms,imported_at_ms,last_activity_at_ms,current_view_json FROM codexes WHERE codex_id=?`, id)
+	return s.getCodex(ctx, `SELECT `+codexSelectColumns+` FROM codexes WHERE codex_id=?`, id)
 }
 
 func (s *Store) GetCodexByThread(ctx context.Context, threadID string) (CodexRecord, error) {
-	return s.getCodex(ctx, `SELECT codex_id,thread_id,session_source,cwd,title,origin,status,active_turn_id,runtime_version,created_at_ms,imported_at_ms,last_activity_at_ms,current_view_json FROM codexes WHERE thread_id=? ORDER BY last_activity_at_ms DESC LIMIT 1`, threadID)
+	return s.getCodex(ctx, `SELECT `+codexSelectColumns+` FROM codexes WHERE thread_id=? ORDER BY last_activity_at_ms DESC LIMIT 1`, threadID)
 }
 
 func (s *Store) GetCodexBySession(ctx context.Context, source, sessionID string) (CodexRecord, error) {
-	return s.getCodex2(ctx, `SELECT codex_id,thread_id,session_source,cwd,title,origin,status,active_turn_id,runtime_version,created_at_ms,imported_at_ms,last_activity_at_ms,current_view_json FROM codexes WHERE session_source=? AND thread_id=?`, normalizeSessionSource(source), sessionID)
+	return s.getCodex2(ctx, `SELECT `+codexSelectColumns+` FROM codexes WHERE session_source=? AND thread_id=?`, normalizeSessionSource(source), sessionID)
 }
 
 func (s *Store) ListCodexes(ctx context.Context, limit int, offset int) ([]CodexRecord, error) {
@@ -238,7 +280,7 @@ func (s *Store) ListCodexes(ctx context.Context, limit int, offset int) ([]Codex
 	if offset < 0 {
 		offset = 0
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT codex_id,thread_id,session_source,cwd,title,origin,status,active_turn_id,runtime_version,created_at_ms,imported_at_ms,last_activity_at_ms,current_view_json FROM codexes ORDER BY last_activity_at_ms DESC,codex_id LIMIT ? OFFSET ?`, limit, offset)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+codexSelectColumns+` FROM codexes ORDER BY last_activity_at_ms DESC,codex_id LIMIT ? OFFSET ?`, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -246,7 +288,7 @@ func (s *Store) ListCodexes(ctx context.Context, limit int, offset int) ([]Codex
 	var out []CodexRecord
 	for rows.Next() {
 		var r CodexRecord
-		if err := rows.Scan(&r.CodexID, &r.ThreadID, &r.SessionSource, &r.CWD, &r.Title, &r.Origin, &r.Status, &r.ActiveTurnID, &r.RuntimeVersion, &r.CreatedAtUnixMS, &r.ImportedAtUnixMS, &r.LastActivityAtUnixMS, &r.CurrentViewJSON); err != nil {
+		if err := scanCodex(rows.Scan, &r); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -256,14 +298,18 @@ func (s *Store) ListCodexes(ctx context.Context, limit int, offset int) ([]Codex
 
 func (s *Store) getCodex(ctx context.Context, query, arg string) (CodexRecord, error) {
 	var r CodexRecord
-	err := s.db.QueryRowContext(ctx, query, arg).Scan(&r.CodexID, &r.ThreadID, &r.SessionSource, &r.CWD, &r.Title, &r.Origin, &r.Status, &r.ActiveTurnID, &r.RuntimeVersion, &r.CreatedAtUnixMS, &r.ImportedAtUnixMS, &r.LastActivityAtUnixMS, &r.CurrentViewJSON)
+	err := scanCodex(s.db.QueryRowContext(ctx, query, arg).Scan, &r)
 	return r, err
 }
 
 func (s *Store) getCodex2(ctx context.Context, query, arg1, arg2 string) (CodexRecord, error) {
 	var r CodexRecord
-	err := s.db.QueryRowContext(ctx, query, arg1, arg2).Scan(&r.CodexID, &r.ThreadID, &r.SessionSource, &r.CWD, &r.Title, &r.Origin, &r.Status, &r.ActiveTurnID, &r.RuntimeVersion, &r.CreatedAtUnixMS, &r.ImportedAtUnixMS, &r.LastActivityAtUnixMS, &r.CurrentViewJSON)
+	err := scanCodex(s.db.QueryRowContext(ctx, query, arg1, arg2).Scan, &r)
 	return r, err
+}
+
+func scanCodex(scan func(...any) error, r *CodexRecord) error {
+	return scan(&r.CodexID, &r.ThreadID, &r.SessionSource, &r.CWD, &r.Title, &r.Origin, &r.Status, &r.ActiveTurnID, &r.RuntimeVersion, &r.CreatedAtUnixMS, &r.ImportedAtUnixMS, &r.LastActivityAtUnixMS, &r.CurrentViewJSON, &r.ManagementState, &r.ManagedUntilUnixMS, &r.WarningDeadlineUnixMS)
 }
 
 func (s *Store) SetCurrentView(ctx context.Context, codexID string, viewJSON []byte) error {

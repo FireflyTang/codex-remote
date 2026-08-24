@@ -37,7 +37,13 @@ func (testIdentity) WhoIs(context.Context, string) (tailnet.PeerIdentity, error)
 	return tailnet.PeerIdentity{NodeID: "n", UserID: "u"}, nil
 }
 
-type testBackend struct{ starts int }
+type testBackend struct {
+	starts           int
+	unmanages        int
+	workspaceWrites  int
+	workspaceUploads int
+	unmanageErr      error
+}
 
 type errorBackend struct {
 	testBackend
@@ -82,6 +88,33 @@ func (*testBackend) RespondApproval(context.Context, *remotev1.RespondApprovalRe
 func (*testBackend) RespondUserInput(context.Context, *remotev1.RespondUserInputRequest) (*remotev1.RespondUserInputResponse, error) {
 	return &remotev1.RespondUserInputResponse{}, nil
 }
+func (b *testBackend) UnmanageCodex(context.Context, *remotev1.UnmanageCodexRequest) (*remotev1.UnmanageCodexResponse, error) {
+	b.unmanages++
+	if b.unmanageErr != nil {
+		return nil, b.unmanageErr
+	}
+	return &remotev1.UnmanageCodexResponse{Codex: &remotev1.Codex{CodexId: "c"}}, nil
+}
+func (*testBackend) GetWorkspace(context.Context, *remotev1.GetWorkspaceRequest) (*remotev1.GetWorkspaceResponse, error) {
+	return &remotev1.GetWorkspaceResponse{CodexId: "c", WorkspaceRoot: "/tmp/workspace"}, nil
+}
+func (*testBackend) ListWorkspaceEntries(context.Context, *remotev1.ListWorkspaceEntriesRequest) (*remotev1.ListWorkspaceEntriesResponse, error) {
+	return &remotev1.ListWorkspaceEntriesResponse{CodexId: "c"}, nil
+}
+func (*testBackend) ReadWorkspaceTextFile(context.Context, *remotev1.ReadWorkspaceTextFileRequest) (*remotev1.ReadWorkspaceTextFileResponse, error) {
+	return &remotev1.ReadWorkspaceTextFileResponse{Utf8Text: "hello"}, nil
+}
+func (b *testBackend) WriteWorkspaceTextFile(context.Context, *remotev1.WriteWorkspaceTextFileRequest) (*remotev1.WriteWorkspaceTextFileResponse, error) {
+	b.workspaceWrites++
+	return &remotev1.WriteWorkspaceTextFileResponse{Entry: &remotev1.WorkspaceEntry{RelativePath: "a.txt"}}, nil
+}
+func (b *testBackend) UploadWorkspaceEntry(context.Context, *remotev1.UploadWorkspaceEntryRequest) (*remotev1.UploadWorkspaceEntryResponse, error) {
+	b.workspaceUploads++
+	return &remotev1.UploadWorkspaceEntryResponse{Entry: &remotev1.WorkspaceEntry{RelativePath: "b.bin"}}, nil
+}
+func (*testBackend) DownloadWorkspaceEntry(context.Context, *remotev1.DownloadWorkspaceEntryRequest) (*remotev1.DownloadWorkspaceEntryResponse, error) {
+	return &remotev1.DownloadWorkspaceEntryResponse{Filename: "a.txt", Content: []byte("hello")}, nil
+}
 
 func TestDispatcherPersistsSideEffectDedup(t *testing.T) {
 	p, err := persistence.Open(filepath.Join(t.TempDir(), "state.db"))
@@ -99,6 +132,99 @@ func TestDispatcherPersistsSideEffectDedup(t *testing.T) {
 	r2, err := d.Dispatch(context.Background(), req)
 	if err != nil || !r2.GetStartTurn().Deduplicated || b.starts != 1 {
 		t.Fatalf("second %+v starts=%d err=%v", r2, b.starts, err)
+	}
+}
+
+func TestDispatcherUnmanageDedupAndRPCErrorPassThrough(t *testing.T) {
+	p, err := persistence.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	b := new(testBackend)
+	d := &Dispatcher{Backend: b, Dedup: p}
+	req := &remotev1.Request{RequestId: "unmanage", Request: &remotev1.Request_UnmanageCodex{UnmanageCodex: &remotev1.UnmanageCodexRequest{CodexId: "c"}}}
+	first, err := d.Dispatch(context.Background(), req)
+	if err != nil || first.GetUnmanageCodex() == nil || first.GetUnmanageCodex().GetDeduplicated() {
+		t.Fatalf("first UnmanageCodex = %+v, %v", first, err)
+	}
+	second, err := d.Dispatch(context.Background(), req)
+	if err != nil || second.GetUnmanageCodex() == nil || !second.GetUnmanageCodex().GetDeduplicated() || b.unmanages != 1 {
+		t.Fatalf("second UnmanageCodex = %+v, calls=%d, err=%v", second, b.unmanages, err)
+	}
+
+	b.unmanageErr = &RPCError{Detail: &remotev1.Error{Code: remotev1.ErrorCode_ERROR_CODE_CODEX_BUSY, Message: "busy", Retryable: false}}
+	errorReq := &remotev1.Request{RequestId: "unmanage-busy", Request: &remotev1.Request_UnmanageCodex{UnmanageCodex: &remotev1.UnmanageCodexRequest{CodexId: "c"}}}
+	got, err := d.Dispatch(context.Background(), errorReq)
+	if err != nil || got.GetError() == nil || got.GetError().Code != remotev1.ErrorCode_ERROR_CODE_CODEX_BUSY || got.GetError().Message != "busy" || got.GetError().Retryable {
+		t.Fatalf("UnmanageCodex RPC error = %+v, %v", got, err)
+	}
+}
+
+func TestDispatcherWorkspaceQueriesAndMutationDedup(t *testing.T) {
+	p, err := persistence.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	b := new(testBackend)
+	d := &Dispatcher{Backend: b, Dedup: p}
+
+	queries := []struct {
+		req *remotev1.Request
+		ok  func(*remotev1.Response) bool
+	}{
+		{req: &remotev1.Request{RequestId: "get-workspace", Request: &remotev1.Request_GetWorkspace{GetWorkspace: &remotev1.GetWorkspaceRequest{CodexId: "c"}}}, ok: func(resp *remotev1.Response) bool { return resp.GetGetWorkspace() != nil }},
+		{req: &remotev1.Request{RequestId: "list-workspace", Request: &remotev1.Request_ListWorkspaceEntries{ListWorkspaceEntries: &remotev1.ListWorkspaceEntriesRequest{CodexId: "c"}}}, ok: func(resp *remotev1.Response) bool { return resp.GetListWorkspaceEntries() != nil }},
+		{req: &remotev1.Request{RequestId: "read-workspace", Request: &remotev1.Request_ReadWorkspaceTextFile{ReadWorkspaceTextFile: &remotev1.ReadWorkspaceTextFileRequest{CodexId: "c", RelativePath: "a.txt"}}}, ok: func(resp *remotev1.Response) bool { return resp.GetReadWorkspaceTextFile() != nil }},
+		{req: &remotev1.Request{RequestId: "download-workspace", Request: &remotev1.Request_DownloadWorkspaceEntry{DownloadWorkspaceEntry: &remotev1.DownloadWorkspaceEntryRequest{CodexId: "c", RelativePath: "a.txt"}}}, ok: func(resp *remotev1.Response) bool { return resp.GetDownloadWorkspaceEntry() != nil }},
+	}
+	for _, query := range queries {
+		resp, dispatchErr := d.Dispatch(context.Background(), query.req)
+		if dispatchErr != nil || resp.GetError() != nil || !query.ok(resp) {
+			t.Fatalf("query %T = %+v, %v", query.req.Request, resp, dispatchErr)
+		}
+	}
+
+	write := &remotev1.Request{RequestId: "write-workspace", Request: &remotev1.Request_WriteWorkspaceTextFile{WriteWorkspaceTextFile: &remotev1.WriteWorkspaceTextFileRequest{CodexId: "c", RelativePath: "a.txt", Utf8Text: "hello"}}}
+	firstWrite, err := d.Dispatch(context.Background(), write)
+	if err != nil || firstWrite.GetWriteWorkspaceTextFile() == nil || firstWrite.GetWriteWorkspaceTextFile().GetDeduplicated() {
+		t.Fatalf("first WriteWorkspaceTextFile = %+v, %v", firstWrite, err)
+	}
+	secondWrite, err := d.Dispatch(context.Background(), write)
+	if err != nil || secondWrite.GetWriteWorkspaceTextFile() == nil || !secondWrite.GetWriteWorkspaceTextFile().GetDeduplicated() || b.workspaceWrites != 1 {
+		t.Fatalf("second WriteWorkspaceTextFile = %+v, calls=%d, err=%v", secondWrite, b.workspaceWrites, err)
+	}
+
+	upload := &remotev1.Request{RequestId: "upload-workspace", Request: &remotev1.Request_UploadWorkspaceEntry{UploadWorkspaceEntry: &remotev1.UploadWorkspaceEntryRequest{CodexId: "c", DestinationPath: "b.bin", Content: []byte("hello")}}}
+	firstUpload, err := d.Dispatch(context.Background(), upload)
+	if err != nil || firstUpload.GetUploadWorkspaceEntry() == nil || firstUpload.GetUploadWorkspaceEntry().GetDeduplicated() {
+		t.Fatalf("first UploadWorkspaceEntry = %+v, %v", firstUpload, err)
+	}
+	secondUpload, err := d.Dispatch(context.Background(), upload)
+	if err != nil || secondUpload.GetUploadWorkspaceEntry() == nil || !secondUpload.GetUploadWorkspaceEntry().GetDeduplicated() || b.workspaceUploads != 1 {
+		t.Fatalf("second UploadWorkspaceEntry = %+v, calls=%d, err=%v", secondUpload, b.workspaceUploads, err)
+	}
+}
+
+func TestWorkspaceOperationClassification(t *testing.T) {
+	tests := []struct {
+		req        *remotev1.Request
+		operation  string
+		sideEffect bool
+	}{
+		{req: &remotev1.Request{Request: &remotev1.Request_GetWorkspace{}}, operation: "get_workspace"},
+		{req: &remotev1.Request{Request: &remotev1.Request_ListWorkspaceEntries{}}, operation: "list_workspace_entries"},
+		{req: &remotev1.Request{Request: &remotev1.Request_ReadWorkspaceTextFile{}}, operation: "read_workspace_text_file"},
+		{req: &remotev1.Request{Request: &remotev1.Request_WriteWorkspaceTextFile{}}, operation: "write_workspace_text_file", sideEffect: true},
+		{req: &remotev1.Request{Request: &remotev1.Request_UploadWorkspaceEntry{}}, operation: "upload_workspace_entry", sideEffect: true},
+		{req: &remotev1.Request{Request: &remotev1.Request_DownloadWorkspaceEntry{}}, operation: "download_workspace_entry"},
+	}
+	for _, test := range tests {
+		op, sideEffect := operation(test.req)
+		if op != test.operation || sideEffect != test.sideEffect {
+			t.Errorf("%T operation = %q, %v; want %q, %v", test.req.Request, op, sideEffect, test.operation, test.sideEffect)
+		}
 	}
 }
 
@@ -147,8 +273,8 @@ func TestWebSocketHelloRPCWatchAndUnwatch(t *testing.T) {
 		t.Fatalf("dial status=%v err=%v", resp, err)
 	}
 	defer ws.CloseNow()
-	writeFrame(t, ctx, ws, &remotev1.Frame{Payload: &remotev1.Frame_ClientHello{ClientHello: &remotev1.ClientHello{ClientId: "client", ClientRunId: "client-run", ProtocolVersion: &remotev1.ProtocolVersion{Major: 1, Minor: 0}}}})
-	if got := readFrame(t, ctx, ws).GetServerHello(); got == nil || got.ConnectionId == "" {
+	writeFrame(t, ctx, ws, &remotev1.Frame{Payload: &remotev1.Frame_ClientHello{ClientHello: &remotev1.ClientHello{ClientId: "client", ClientRunId: "client-run", ProtocolVersion: &remotev1.ProtocolVersion{Major: 1, Minor: 1}}}})
+	if got := readFrame(t, ctx, ws).GetServerHello(); got == nil || got.ConnectionId == "" || got.GetProtocolVersion().GetMajor() != 1 || got.GetProtocolVersion().GetMinor() != 1 {
 		t.Fatalf("hello %+v", got)
 	}
 	writeFrame(t, ctx, ws, &remotev1.Frame{Payload: &remotev1.Frame_Request{Request: &remotev1.Request{RequestId: "host", Request: &remotev1.Request_GetHost{GetHost: &remotev1.GetHostRequest{}}}}})
@@ -199,6 +325,78 @@ func TestConnectRejectsMissingSubprotocol(t *testing.T) {
 	defer cancel()
 	_ = s.Shutdown(ctx)
 	<-done
+}
+
+func TestHandshakeRejectsProtocol10(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	s := NewServer(ServerConfig{HeartbeatInterval: time.Hour, ConnectionTimeout: time.Hour}, &Dispatcher{Backend: new(testBackend)}, nil, testIdentity{}, nil)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- s.Serve(ln) }()
+	defer func() {
+		shutdown, stop := context.WithTimeout(context.Background(), time.Second)
+		defer stop()
+		_ = s.Shutdown(shutdown)
+		<-done
+	}()
+	ws, resp, err := websocket.Dial(ctx, "ws://"+ln.Addr().String()+"/connect", &websocket.DialOptions{Subprotocols: []string{Subprotocol}})
+	if err != nil {
+		t.Fatalf("dial status=%v err=%v", resp, err)
+	}
+	defer ws.CloseNow()
+	writeFrame(t, ctx, ws, &remotev1.Frame{Payload: &remotev1.Frame_ClientHello{ClientHello: &remotev1.ClientHello{ClientId: "client", ClientRunId: "run", ProtocolVersion: &remotev1.ProtocolVersion{Major: 1, Minor: 0}}}})
+	closeFrame := readFrame(t, ctx, ws).GetClose()
+	if closeFrame == nil || closeFrame.Code != remotev1.CloseCode_CLOSE_CODE_PROTOCOL_VERSION_UNSUPPORTED {
+		t.Fatalf("protocol 1.0 close = %+v", closeFrame)
+	}
+}
+
+func TestPongForegroundCodexesRenewWithoutClosingOnFailure(t *testing.T) {
+	var calls atomic.Int32
+	renewed := make(chan []string, 1)
+	reported := make(chan error, 1)
+	cfg := ServerConfig{
+		HeartbeatInterval: time.Hour,
+		ConnectionTimeout: 2 * time.Hour,
+		RenewForegroundCodexes: func(_ context.Context, ids []string) error {
+			calls.Add(1)
+			renewed <- ids
+			return errors.New("renew unavailable")
+		},
+		AuditError: func(err error) { reported <- err },
+	}
+	ws, ctx := dialGateway(t, cfg, new(testBackend), nil)
+	want := []string{"known", "known", "unknown"}
+	writeFrame(t, ctx, ws, &remotev1.Frame{Payload: &remotev1.Frame_Pong{Pong: &remotev1.Pong{ForegroundCodexIds: want}}})
+	select {
+	case got := <-renewed:
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Fatalf("foreground IDs = %v, want %v", got, want)
+		}
+	case <-ctx.Done():
+		t.Fatal("foreground renewal was not called")
+	}
+	select {
+	case err := <-reported:
+		if err == nil || err.Error() != "renew unavailable" {
+			t.Fatalf("reported renewal error = %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("renewal error was not reported")
+	}
+
+	writeFrame(t, ctx, ws, &remotev1.Frame{Payload: &remotev1.Frame_Pong{Pong: &remotev1.Pong{Nonce: 7}}})
+	writeFrame(t, ctx, ws, &remotev1.Frame{Payload: &remotev1.Frame_Request{Request: &remotev1.Request{RequestId: "host-after-renew-error", Request: &remotev1.Request_GetHost{GetHost: &remotev1.GetHostRequest{}}}}})
+	if got := readFrame(t, ctx, ws).GetResponse(); got == nil || got.GetGetHost() == nil {
+		t.Fatalf("RPC after renewal error = %+v", got)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("renew calls after ordinary Pong = %d, want 1", got)
+	}
 }
 
 func TestProtocolCloseBypassesFullSendQueue(t *testing.T) {
@@ -382,8 +580,8 @@ func dialGateway(t *testing.T, cfg ServerConfig, backend Backend, aud WireAudito
 		<-done
 		cancel()
 	})
-	writeFrame(t, ctx, ws, &remotev1.Frame{Payload: &remotev1.Frame_ClientHello{ClientHello: &remotev1.ClientHello{ClientId: "client", ClientRunId: "client-run", ProtocolVersion: &remotev1.ProtocolVersion{Major: 1, Minor: 0}}}})
-	if got := readFrame(t, ctx, ws).GetServerHello(); got == nil {
+	writeFrame(t, ctx, ws, &remotev1.Frame{Payload: &remotev1.Frame_ClientHello{ClientHello: &remotev1.ClientHello{ClientId: "client", ClientRunId: "client-run", ProtocolVersion: &remotev1.ProtocolVersion{Major: 1, Minor: 1}}}})
+	if got := readFrame(t, ctx, ws).GetServerHello(); got == nil || got.GetProtocolVersion().GetMajor() != 1 || got.GetProtocolVersion().GetMinor() != 1 {
 		t.Fatalf("ServerHello = %+v", got)
 	}
 	return ws, ctx

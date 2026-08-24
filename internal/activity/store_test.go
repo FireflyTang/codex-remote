@@ -294,6 +294,42 @@ func TestWatchRejectsUnknownCodex(t *testing.T) {
 	}
 }
 
+func TestReloadDurableReplacesCachedResetView(t *testing.T) {
+	ctx := context.Background()
+	p := newPersistence(t)
+	oldRaw, err := protojson.Marshal(&remotev1.CurrentView{Codex: &remotev1.Codex{CodexId: "c", Title: "old"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.SetCurrentView(ctx, "c", oldRaw); err != nil {
+		t.Fatal(err)
+	}
+	s := NewStore(p, nil, 4)
+	primed, err := s.Watch(ctx, "c", nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	primed.Cancel()
+	newRaw, err := protojson.Marshal(&remotev1.CurrentView{Codex: &remotev1.Codex{CodexId: "c", Title: "rolled back"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.SetCurrentView(ctx, "c", newRaw); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReloadDurable(ctx, "c"); err != nil {
+		t.Fatal(err)
+	}
+	reset, err := s.Watch(ctx, "c", nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reset.Cancel()
+	if reset.Response.GetResetView().GetCodex().GetTitle() != "rolled back" {
+		t.Fatalf("reloaded RESET=%+v", reset.Response)
+	}
+}
+
 func TestAuditFailureDoesNotSwallowBusinessEvent(t *testing.T) {
 	ctx := context.Background()
 	p := newPersistence(t)

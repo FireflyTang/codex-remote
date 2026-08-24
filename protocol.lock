@@ -2,10 +2,11 @@
   "schema": "codex.remote.v1",
   "repository": "https://github.com/FireflyTang/codex-remote-protocol",
   "module": "github.com/FireflyTang/codex-remote-protocol",
-  "version": "v1.0.0",
-  "commit": "b4f2e6c49961bf956f4a3887483965a3edc731db",
+  "version": "v1.1.0",
+  "tag": "v1.1.0",
+  "commit": "2d62bc6ecafc84c79cffb9ee287fb0436997c3b9",
   "descriptor": {
     "path": "descriptor/codex-remote-v1.binpb",
-    "sha256": "d2d155ba9e14d62a924c3c407f6c10be9e1eccaff5b5e1e4ddcdff264df7eee2"
+    "sha256": "393a4647f0e266d0f4fddafc4a588c655981296250e943e61e68fba99fe51430"
   }
 }

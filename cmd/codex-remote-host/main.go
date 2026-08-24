@@ -25,6 +25,7 @@ import (
 	"github.com/kylin1993/codex-remote/internal/persistence"
 	"github.com/kylin1993/codex-remote/internal/runtime"
 	"github.com/kylin1993/codex-remote/internal/tailnet"
+	"github.com/kylin1993/codex-remote/internal/workspace"
 )
 
 const version = "0.1.0"
@@ -37,7 +38,7 @@ func (s *stringList) Set(v string) error { *s = append(*s, v); return nil }
 type config struct {
 	dataDir, auditDir, hostname, authKeyEnv, appExecutable, socketPath, devListen string
 	appArgs                                                                       stringList
-	heartbeat, timeout                                                            time.Duration
+	heartbeat, timeout, leaseDuration, leaseWarningBefore, leaseSweepInterval     time.Duration
 	sendQueue, watchQueue, maxFrame, replayCapacity, maxPage                      int
 }
 
@@ -64,6 +65,9 @@ func run() error {
 	flag.StringVar(&cfg.devListen, "dev-listen", "", "DEV/TEST ONLY host TCP address (for example 127.0.0.1:0); bypasses tsnet and is never an automatic fallback")
 	flag.DurationVar(&cfg.heartbeat, "heartbeat", 15*time.Second, "application heartbeat interval")
 	flag.DurationVar(&cfg.timeout, "connection-timeout", 45*time.Second, "connection inactivity timeout")
+	flag.DurationVar(&cfg.leaseDuration, "lease-duration", 2*time.Hour, "managed Codex inactivity lease duration")
+	flag.DurationVar(&cfg.leaseWarningBefore, "lease-warning-before", 30*time.Minute, "time before lease expiry to emit a warning")
+	flag.DurationVar(&cfg.leaseSweepInterval, "lease-sweep-interval", time.Minute, "managed Codex lease sweep interval")
 	flag.IntVar(&cfg.sendQueue, "send-queue", 256, "bounded connection send queue")
 	flag.IntVar(&cfg.watchQueue, "watch-queue", 128, "bounded per-watch live queue")
 	flag.IntVar(&cfg.maxFrame, "max-frame-bytes", 4<<20, "maximum ProtoJSON frame bytes")
@@ -136,14 +140,26 @@ func run() error {
 	}()
 	eventStore := activity.NewStore(store, recorder, cfg.replayCapacity)
 	caps := capability.New(uint32(64), uint32(cfg.maxPage))
+	workspaceService, err := workspaceServiceForFrame(cfg.maxFrame)
+	if err != nil {
+		return fmt.Errorf("configure workspace: %w", err)
+	}
+	if err := caps.SetWorkspaceCapabilities(workspaceService.Capabilities()); err != nil {
+		return fmt.Errorf("advertise workspace: %w", err)
+	}
 	manager := codex.NewManager(runtimeManager, store, eventStore, directory.Service{}, caps, hostID, version)
+	manager.SetWorkspaceService(workspaceService)
 	manager.MaxPage = uint32(cfg.maxPage)
 	manager.ContentBudget = cfg.maxFrame / 2
 	manager.Degraded = recorder.Degraded
+	manager.LeaseDuration = cfg.leaseDuration
+	manager.LeaseWarningBefore = cfg.leaseWarningBefore
+	manager.LeaseSweepInterval = cfg.leaseSweepInterval
 	if err := manager.Restore(ctx); err != nil {
 		return fmt.Errorf("restore managed sessions: %w", err)
 	}
 	go manager.RunEvents(ctx)
+	go manager.RunLeaseSweeper(ctx)
 	go func() {
 		for st := range runtimeManager.States() {
 			outcome := remotev1.AuditOutcome_AUDIT_OUTCOME_SUCCEEDED
@@ -163,7 +179,7 @@ func run() error {
 		}
 	}()
 	dispatcher := &gateway.Dispatcher{Backend: manager, Dedup: store}
-	gwcfg := gateway.ServerConfig{MaxFrameBytes: int64(cfg.maxFrame), SendQueueSize: cfg.sendQueue, WatchQueueSize: cfg.watchQueue, HeartbeatInterval: cfg.heartbeat, ConnectionTimeout: cfg.timeout, MaxWatches: 64, HostID: hostID, HostRunID: runID, HostVersion: version, AuditError: reportAudit, Hello: func(ctx context.Context) (*remotev1.ServerHello, error) {
+	gwcfg := gateway.ServerConfig{MaxFrameBytes: int64(cfg.maxFrame), SendQueueSize: cfg.sendQueue, WatchQueueSize: cfg.watchQueue, HeartbeatInterval: cfg.heartbeat, ConnectionTimeout: cfg.timeout, MaxWatches: 64, HostID: hostID, HostRunID: runID, HostVersion: version, RenewForegroundCodexes: manager.RenewForegroundCodexes, AuditError: reportAudit, Hello: func(ctx context.Context) (*remotev1.ServerHello, error) {
 		h, err := manager.GetHost(ctx, &remotev1.GetHostRequest{})
 		if err != nil {
 			return nil, err
@@ -221,6 +237,23 @@ func run() error {
 	reportAudit(recorder.Record(context.Background(), hostAction("gateway.serve", remotev1.AuditOutcome_AUDIT_OUTCOME_SUCCEEDED, "gateway stopped")))
 	reportAudit(recorder.Record(context.Background(), &remotev1.AuditRecord{Kind: remotev1.AuditKind_AUDIT_KIND_PROCESS_LIFECYCLE, Direction: remotev1.AuditDirection_AUDIT_DIRECTION_INTERNAL, Outcome: remotev1.AuditOutcome_AUDIT_OUTCOME_SUCCEEDED, Component: "host", Operation: "host.stop", Message: "Codex Remote Host stopped"}))
 	return nil
+}
+
+func workspaceServiceForFrame(maxFrameBytes int) (*workspace.Service, error) {
+	if maxFrameBytes < 0 {
+		return nil, errors.New("max frame bytes must be positive")
+	}
+	limits, err := capability.WorkspaceCapabilitiesForFrame(uint64(maxFrameBytes))
+	if err != nil {
+		return nil, err
+	}
+	return workspace.New(workspace.Config{
+		MaxTextFileBytes:        limits.GetMaxTextFileBytes(),
+		MaxInlineUploadBytes:    limits.GetMaxInlineUploadBytes(),
+		MaxInlineDownloadBytes:  limits.GetMaxInlineDownloadBytes(),
+		MaxArchiveExpandedBytes: limits.GetMaxArchiveExpandedBytes(),
+		MaxArchiveEntryCount:    limits.GetMaxArchiveEntryCount(),
+	})
 }
 
 func hostAction(operation string, outcome remotev1.AuditOutcome, message string) *remotev1.AuditRecord {

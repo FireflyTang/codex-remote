@@ -1,6 +1,7 @@
 package capability
 
 import (
+	"errors"
 	"sort"
 	"strings"
 	"sync"
@@ -12,6 +13,52 @@ import (
 type Service struct {
 	mu    sync.RWMutex
 	value *remotev1.Capabilities
+}
+
+const (
+	DefaultMaxTextFileBytes        = uint64(512 << 10)
+	DefaultMaxInlineUploadBytes    = uint64(2 << 20)
+	DefaultMaxInlineDownloadBytes  = uint64(2 << 20)
+	DefaultMaxArchiveExpandedBytes = uint64(32 << 20)
+	DefaultMaxArchiveEntryCount    = uint32(1000)
+)
+
+func DefaultWorkspaceCapabilities() *remotev1.WorkspaceCapabilities {
+	return &remotev1.WorkspaceCapabilities{
+		MaxTextFileBytes:        DefaultMaxTextFileBytes,
+		MaxInlineUploadBytes:    DefaultMaxInlineUploadBytes,
+		MaxInlineDownloadBytes:  DefaultMaxInlineDownloadBytes,
+		MaxArchiveExpandedBytes: DefaultMaxArchiveExpandedBytes,
+		MaxArchiveEntryCount:    DefaultMaxArchiveEntryCount,
+	}
+}
+
+// WorkspaceCapabilitiesForFrame keeps binary payloads at most half of a frame
+// for ProtoJSON base64 expansion. Text is limited to one eighth because a
+// valid UTF-8 control byte can occupy six JSON bytes (for example, \u0000),
+// while the surrounding Frame/Response/WorkspaceEntry still needs headroom.
+// The remaining archive limits do not travel inline in their expanded form.
+func WorkspaceCapabilitiesForFrame(maxFrameBytes uint64) (*remotev1.WorkspaceCapabilities, error) {
+	if maxFrameBytes < 8 {
+		return nil, errors.New("max frame bytes must allow a positive workspace payload")
+	}
+	caps := DefaultWorkspaceCapabilities()
+	textLimit := maxFrameBytes / 8
+	binaryLimit := maxFrameBytes / 2
+	caps.MaxTextFileBytes = min(caps.MaxTextFileBytes, textLimit)
+	caps.MaxInlineUploadBytes = min(caps.MaxInlineUploadBytes, binaryLimit)
+	caps.MaxInlineDownloadBytes = min(caps.MaxInlineDownloadBytes, binaryLimit)
+	return caps, nil
+}
+
+func (s *Service) SetWorkspaceCapabilities(v *remotev1.WorkspaceCapabilities) error {
+	if v == nil || v.GetMaxTextFileBytes() == 0 || v.GetMaxInlineUploadBytes() == 0 || v.GetMaxInlineDownloadBytes() == 0 || v.GetMaxArchiveExpandedBytes() == 0 || v.GetMaxArchiveEntryCount() == 0 {
+		return errors.New("all workspace capability limits must be positive")
+	}
+	s.mu.Lock()
+	s.value.Workspace = proto.Clone(v).(*remotev1.WorkspaceCapabilities)
+	s.mu.Unlock()
+	return nil
 }
 
 // ObserveSessionSources incorporates source kinds actually reported by the
@@ -37,7 +84,7 @@ func (s *Service) ObserveSessionSources(sources ...string) {
 }
 
 func New(maxWatches, maxPage uint32) *Service {
-	return &Service{value: &remotev1.Capabilities{FeatureIds: []string{"directories", "sessions", "history", "watch_replay", "approvals", "user_input", "interrupt", "diagnostic_audit"}, SessionSourceKinds: []string{"cli", "vscode", "exec", "appServer", "unknown"}, MaxWatchesPerConnection: maxWatches, MaxPageSize: maxPage}}
+	return &Service{value: &remotev1.Capabilities{FeatureIds: []string{"directories", "sessions", "history", "watch_replay", "approvals", "user_input", "interrupt", "diagnostic_audit", "management_lease", "unmanage_codex", "workspace"}, SessionSourceKinds: []string{"cli", "vscode", "exec", "appServer", "unknown"}, MaxWatchesPerConnection: maxWatches, MaxPageSize: maxPage, Workspace: DefaultWorkspaceCapabilities()}}
 }
 func (s *Service) Get() *remotev1.Capabilities {
 	s.mu.RLock()
