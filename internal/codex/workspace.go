@@ -231,6 +231,35 @@ func (m *Manager) commitWorkspaceState(ctx context.Context, codexID string, stat
 		m.mu.Unlock()
 		return rpcErr(remotev1.ErrorCode_ERROR_CODE_CODEX_NOT_FOUND, errors.New("codex not found"))
 	}
+	// A live transition may have waited behind a runtime Ready restore. The
+	// restore reconstructs a newer generation while holding commitMu, so never
+	// let the delayed transition overwrite that newer durable snapshot.
+	if current := view.GetWorkspaceAccessState(); current != nil {
+		if current.Generation > state.Generation {
+			m.mu.Unlock()
+			return nil
+		}
+		if current.Generation == state.Generation && proto.Equal(current, state) {
+			m.mu.Unlock()
+			raw, readErr := m.Persistence.CurrentView(context.Background(), codexID)
+			durable := new(remotev1.CurrentView)
+			if readErr == nil {
+				readErr = protojson.Unmarshal(raw, durable)
+			}
+			if readErr == nil && durable.WorkspaceAccessState != nil && proto.Equal(durable.WorkspaceAccessState, state) {
+				return nil
+			}
+			// The matching in-memory state may have come from a Restore whose
+			// persistence failed. In that case continue through the normal publish
+			// path instead of falsely acknowledging adoption.
+			m.mu.Lock()
+			view = m.byID[codexID]
+			if view == nil || view.Codex == nil {
+				m.mu.Unlock()
+				return rpcErr(remotev1.ErrorCode_ERROR_CODE_CODEX_NOT_FOUND, errors.New("codex not found"))
+			}
+		}
+	}
 	snapshot := proto.Clone(view).(*remotev1.CurrentView)
 	snapshot.WorkspaceAccessState = proto.Clone(state).(*remotev1.WorkspaceAccessState)
 	snapshot.GeneratedAtUnixMs = m.now().UnixMilli()
@@ -321,7 +350,7 @@ func (m *Manager) GetWorkspace(_ context.Context, req *remotev1.GetWorkspaceRequ
 	return &remotev1.GetWorkspaceResponse{CodexId: req.CodexId, WorkspaceRoot: root, AccessState: state}, nil
 }
 
-func (m *Manager) ListWorkspaceEntries(_ context.Context, req *remotev1.ListWorkspaceEntriesRequest) (*remotev1.ListWorkspaceEntriesResponse, error) {
+func (m *Manager) ListWorkspaceEntries(ctx context.Context, req *remotev1.ListWorkspaceEntriesRequest) (*remotev1.ListWorkspaceEntriesResponse, error) {
 	if req == nil || req.CodexId == "" {
 		return nil, rpcErr(remotev1.ErrorCode_ERROR_CODE_INVALID_REQUEST, errors.New("codex id is required"))
 	}
@@ -329,26 +358,23 @@ func (m *Manager) ListWorkspaceEntries(_ context.Context, req *remotev1.ListWork
 	if err != nil {
 		return nil, rpcErr(remotev1.ErrorCode_ERROR_CODE_INVALID_REQUEST, err)
 	}
-	entries, err := m.Workspaces.List(req.CodexId, req.RelativeDirectory)
+	entries, total, err := m.Workspaces.List(ctx, req.CodexId, req.RelativeDirectory, start, size)
 	if err != nil {
 		return nil, m.workspaceError(err)
 	}
-	if start > len(entries) {
-		return nil, rpcErr(remotev1.ErrorCode_ERROR_CODE_INVALID_REQUEST, errors.New("page token offset is out of range"))
-	}
-	end := min(start+size, len(entries))
 	pageInfo := &remotev1.PageInfo{}
-	if end < len(entries) {
-		pageInfo.NextPageToken = encodePageToken(pageToken{Operation: "workspace_list", Query: req.CodexId + "\x00" + req.RelativeDirectory, Offset: end})
+	next := start + len(entries)
+	if next < total {
+		pageInfo.NextPageToken = encodePageToken(pageToken{Operation: "workspace_list", Query: req.CodexId + "\x00" + req.RelativeDirectory, Offset: next})
 	}
-	return &remotev1.ListWorkspaceEntriesResponse{CodexId: req.CodexId, RelativeDirectory: req.RelativeDirectory, Entries: entries[start:end], Page: pageInfo}, nil
+	return &remotev1.ListWorkspaceEntriesResponse{CodexId: req.CodexId, RelativeDirectory: req.RelativeDirectory, Entries: entries, Page: pageInfo}, nil
 }
 
-func (m *Manager) ReadWorkspaceTextFile(_ context.Context, req *remotev1.ReadWorkspaceTextFileRequest) (*remotev1.ReadWorkspaceTextFileResponse, error) {
+func (m *Manager) ReadWorkspaceTextFile(ctx context.Context, req *remotev1.ReadWorkspaceTextFileRequest) (*remotev1.ReadWorkspaceTextFileResponse, error) {
 	if req == nil || req.CodexId == "" {
 		return nil, rpcErr(remotev1.ErrorCode_ERROR_CODE_INVALID_REQUEST, errors.New("codex id is required"))
 	}
-	entry, text, err := m.Workspaces.ReadText(req.CodexId, req.RelativePath)
+	entry, text, err := m.Workspaces.ReadText(ctx, req.CodexId, req.RelativePath)
 	if err != nil {
 		return nil, m.workspaceError(err)
 	}
@@ -370,18 +396,18 @@ func (m *Manager) UploadWorkspaceEntry(ctx context.Context, req *remotev1.Upload
 	if req == nil || req.CodexId == "" {
 		return nil, rpcErr(remotev1.ErrorCode_ERROR_CODE_INVALID_REQUEST, errors.New("codex id is required"))
 	}
-	entry, err := m.Workspaces.Upload(ctx, req.CodexId, req.DestinationPath, req.Kind, req.Content, req.Condition, req.ExpectedRevision, req.ExpectedQuiescenceToken)
+	entry, err := m.Workspaces.Upload(ctx, req.CodexId, req.DestinationPath, req.Kind, req.Content, req.ExpectedQuiescenceToken)
 	if err != nil {
 		return nil, m.workspaceError(err)
 	}
 	return &remotev1.UploadWorkspaceEntryResponse{Entry: entry}, nil
 }
 
-func (m *Manager) DownloadWorkspaceEntry(_ context.Context, req *remotev1.DownloadWorkspaceEntryRequest) (*remotev1.DownloadWorkspaceEntryResponse, error) {
+func (m *Manager) DownloadWorkspaceEntry(ctx context.Context, req *remotev1.DownloadWorkspaceEntryRequest) (*remotev1.DownloadWorkspaceEntryResponse, error) {
 	if req == nil || req.CodexId == "" {
 		return nil, rpcErr(remotev1.ErrorCode_ERROR_CODE_INVALID_REQUEST, errors.New("codex id is required"))
 	}
-	entry, kind, filename, content, err := m.Workspaces.Download(req.CodexId, req.RelativePath)
+	entry, kind, filename, content, err := m.Workspaces.Download(ctx, req.CodexId, req.RelativePath)
 	if err != nil {
 		return nil, m.workspaceError(err)
 	}

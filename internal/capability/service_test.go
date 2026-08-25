@@ -21,7 +21,7 @@ func TestObserveSessionSourcesFromRuntime(t *testing.T) {
 		features[feature] = true
 	}
 	workspace := got.GetWorkspace()
-	if !found || !features["management_lease"] || !features["unmanage_codex"] || !features["workspace"] || workspace == nil || workspace.GetMaxTextFileBytes() == 0 || workspace.GetMaxInlineUploadBytes() == 0 || workspace.GetMaxInlineDownloadBytes() == 0 || workspace.GetMaxArchiveExpandedBytes() == 0 || workspace.GetMaxArchiveEntryCount() == 0 || got.MaxWatchesPerConnection != 4 || got.MaxPageSize != 20 {
+	if !found || !features["management_lease"] || !features["unmanage_codex"] || !features["rename_codex"] || !features["forget_codex"] || !features["workspace"] || workspace == nil || workspace.GetMaxTextFileBytes() == 0 || workspace.GetMaxInlineUploadBytes() == 0 || workspace.GetMaxInlineDownloadBytes() == 0 || workspace.GetMaxArchiveExpandedBytes() == 0 || workspace.GetMaxArchiveEntryCount() == 0 || got.MaxWatchesPerConnection != 4 || got.MaxPageSize != 20 {
 		t.Fatalf("capabilities %+v", got)
 	}
 }

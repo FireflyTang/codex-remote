@@ -2,8 +2,10 @@ package session
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 
 	"github.com/kylin1993/codex-remote/internal/adapter"
 	"github.com/kylin1993/codex-remote/internal/directory"
@@ -38,6 +40,9 @@ func (s Service) Discover(ctx context.Context, cwd, cursor string, limit uint32)
 	}
 	out := page.Data[:0]
 	for _, t := range page.Data {
+		if !normalizeIdentity(&t) {
+			continue
+		}
 		if t.ParentThreadID != nil {
 			continue
 		}
@@ -57,12 +62,18 @@ func (s Service) Import(ctx context.Context, id string) (adapter.Thread, error) 
 	if t.ParentThreadID != nil {
 		return t, fmt.Errorf("cannot import subagent thread %s", id)
 	}
+	if !normalizeIdentity(&t) || t.ID != id {
+		return t, fmt.Errorf("session identity mismatch for %s", id)
+	}
 	resumed, err := s.Adapter.ResumeThread(ctx, id)
 	if err != nil {
 		return t, err
 	}
 	if len(resumed.Turns) == 0 {
 		resumed.Turns = t.Turns
+	}
+	if !normalizeIdentity(&resumed) || resumed.ID != id {
+		return resumed, fmt.Errorf("resumed session identity mismatch for %s", id)
 	}
 	return resumed, nil
 }
@@ -72,5 +83,22 @@ func (s Service) Create(ctx context.Context, cwd string, create bool) (adapter.T
 		return adapter.Thread{}, false, err
 	}
 	t, err := s.Adapter.StartThread(ctx, p.Path)
+	if err == nil && !normalizeIdentity(&t) {
+		return adapter.Thread{}, p.Created, errors.New("app-server returned an empty thread identity")
+	}
 	return t, p.Created, err
+}
+
+// normalizeIdentity accepts both app-server state-db threads (id) and legacy
+// filesystem-discovered sessions (sessionId) as the same import identity.
+func normalizeIdentity(thread *adapter.Thread) bool {
+	thread.ID = strings.TrimSpace(thread.ID)
+	thread.SessionID = strings.TrimSpace(thread.SessionID)
+	if thread.ID == "" {
+		thread.ID = thread.SessionID
+	}
+	if thread.SessionID == "" {
+		thread.SessionID = thread.ID
+	}
+	return thread.ID != ""
 }

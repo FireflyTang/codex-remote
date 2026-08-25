@@ -4,9 +4,60 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	remotev1 "github.com/FireflyTang/codex-remote-protocol/gen/go/codex/remote/v1"
 )
+
+func TestUnmaterializedUnmanagedCodexMaterializesOnStartTurn(t *testing.T) {
+	requireScenario(t, "unmaterialized-lifecycle")
+	c := dial(t)
+	c.hello(t)
+
+	createdResponse := c.request(t, request("unmaterialized-lifecycle-create", &remotev1.Request_CreateCodex{CreateCodex: &remotev1.CreateCodexRequest{
+		Cwd: filepath.Join(testWorkspace(t), "unmaterialized-lifecycle"), CreateDirectoryIfMissing: true, Title: "unmaterialized lifecycle",
+	}})).GetCreateCodex()
+	if createdResponse == nil || createdResponse.Codex == nil || createdResponse.Codex.CodexId == "" || createdResponse.Codex.ThreadId == "" {
+		t.Fatalf("CreateCodex=%+v", createdResponse)
+	}
+	created := createdResponse.Codex
+	if created.ManagementState != remotev1.ManagementState_MANAGEMENT_STATE_MANAGED {
+		t.Fatalf("new unmaterialized Codex is not managed: %+v", created)
+	}
+	watch := c.request(t, request("unmaterialized-lifecycle-watch", &remotev1.Request_WatchCodex{WatchCodex: &remotev1.WatchCodexRequest{CodexId: created.CodexId}})).GetWatchCodex()
+	if watch == nil || watch.ResetView == nil || watch.ResetView.Codex == nil || watch.ResetView.Codex.CodexId != created.CodexId || watch.ResetView.Codex.ThreadId != created.ThreadId {
+		t.Fatalf("WatchCodex=%+v", watch)
+	}
+
+	unmanagedResponse := c.request(t, request("unmaterialized-lifecycle-unmanage", &remotev1.Request_UnmanageCodex{UnmanageCodex: &remotev1.UnmanageCodexRequest{CodexId: created.CodexId}})).GetUnmanageCodex()
+	if unmanagedResponse == nil || unmanagedResponse.Codex == nil {
+		t.Fatalf("UnmanageCodex=%+v", unmanagedResponse)
+	}
+	unmanaged := unmanagedResponse.Codex
+	if unmanaged.ManagementState != remotev1.ManagementState_MANAGEMENT_STATE_UNMANAGED || unmanaged.CodexId != created.CodexId || unmanaged.ThreadId != created.ThreadId {
+		t.Fatalf("UnmanageCodex changed identity/state: before=%+v after=%+v", created, unmanaged)
+	}
+
+	startResponse := c.request(t, request("unmaterialized-lifecycle-first-turn", &remotev1.Request_StartTurn{StartTurn: &remotev1.StartTurnRequest{
+		CodexId: created.CodexId,
+		Input:   []*remotev1.UserInputPart{{Content: &remotev1.UserInputPart_Text{Text: &remotev1.TextInput{Text: "materialize this unmanaged thread"}}}},
+	}}))
+	started := startResponse.GetStartTurn()
+	if started == nil || started.TurnId == "" || startResponse.GetError() != nil {
+		t.Fatalf("StartTurn on unmaterialized unmanaged Codex=%+v", startResponse)
+	}
+
+	resumed := listCodex(t, c, created.CodexId)
+	if resumed.ManagementState != remotev1.ManagementState_MANAGEMENT_STATE_MANAGED || resumed.ManagedUntilUnixMs <= time.Now().UnixMilli() || resumed.CodexId != created.CodexId || resumed.ThreadId != created.ThreadId {
+		t.Fatalf("StartTurn did not restore the same Codex/thread: created=%+v unmanaged=%+v resumed=%+v", created, unmanaged, resumed)
+	}
+	waitForTurnStatus(t, c, created.CodexId, started.TurnId, remotev1.TurnStatus_TURN_STATUS_COMPLETED)
+
+	history := c.request(t, request("unmaterialized-lifecycle-history", &remotev1.Request_ListHistory{ListHistory: &remotev1.ListHistoryRequest{CodexId: created.CodexId}})).GetListHistory()
+	if history == nil || history.History == nil || history.History.CodexId != created.CodexId || len(history.History.Turns) != 1 || history.History.Turns[0].TurnId != started.TurnId {
+		t.Fatalf("materialized history lost identity/turn: %+v", history)
+	}
+}
 
 func TestUnmaterializedCreatedThreadHasEmptyHistoryUntilFirstUserMessage(t *testing.T) {
 	requireScenario(t, "unmaterialized-history")

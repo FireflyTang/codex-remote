@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	remotev1 "github.com/FireflyTang/codex-remote-protocol/gen/go/codex/remote/v1"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -162,6 +163,56 @@ func (s *Store) Publish(ctx context.Context, event *remotev1.Event, view *remote
 		}
 	}
 	return ev, nil
+}
+
+// Forget delivers one terminal event to current watchers, closes their
+// streams, and then destroys the durable and in-memory Codex event state.
+// Callers serialize this with all other Codex lifecycle commits.
+func (s *Store) Forget(ctx context.Context, codexID, requestID string, destroy func(context.Context, string) error) (*remotev1.Event, error) {
+	if codexID == "" || destroy == nil {
+		return nil, errors.New("codex id and destroy callback are required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, err := s.ensure(ctx, codexID)
+	if err != nil {
+		return nil, err
+	}
+	event := &remotev1.Event{
+		CodexId:           codexID,
+		EventSeq:          st.head + 1,
+		OccurredAtUnixMs:  time.Now().UnixMilli(),
+		CausedByRequestId: requestID,
+		Event:             &remotev1.Event_CodexForgotten{CodexForgotten: &remotev1.CodexForgotten{}},
+	}
+	if s.audit != nil {
+		if err = s.audit.RecordCanonical(ctx, event, &remotev1.Provenance{Kind: remotev1.ProvenanceKind_PROVENANCE_KIND_LIVE_WIRE, ObservedAtUnixMs: time.Now().UnixMilli()}, ""); err != nil {
+			s.auditErr.Store(err.Error())
+		}
+	}
+	for id, watcher := range st.watchers {
+		// A terminal event takes precedence over queued stale updates. Watch
+		// queues are always buffered, so discard only as much as is needed.
+		for {
+			select {
+			case watcher.events <- proto.Clone(event).(*remotev1.Event):
+				goto delivered
+			default:
+				select {
+				case <-watcher.events:
+				default:
+				}
+			}
+		}
+	delivered:
+		delete(st.watchers, id)
+		close(watcher.events)
+	}
+	if err = destroy(ctx, codexID); err != nil {
+		return nil, err
+	}
+	delete(s.codex, codexID)
+	return proto.Clone(event).(*remotev1.Event), nil
 }
 
 func (s *Store) AuditDegraded() (bool, string) {

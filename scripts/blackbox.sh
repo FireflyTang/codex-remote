@@ -112,7 +112,7 @@ stop_host() {
 }
 
 result=0
-scenario_list="${CODEX_REMOTE_BLACKBOX_SCENARIOS:-normal workspace interrupt approval user-input sessions unmaterialized-history lifecycle structured failed rewatch synthetic-upsert early-large large multi-large burst audit-failure runtime-disconnect}"
+scenario_list="${CODEX_REMOTE_BLACKBOX_SCENARIOS:-normal workspace interrupt approval user-input sessions unmaterialized-history unmaterialized-lifecycle lifecycle rename-forget structured failed rewatch synthetic-upsert early-large large multi-large burst audit-failure runtime-disconnect}"
 for scenario in ${scenario_list}; do
   start_host "${scenario}"
   run_pattern='.'
@@ -126,10 +126,14 @@ for scenario in ${scenario_list}; do
     run_pattern='^Test(DiscoverImportAndContinueUnmanagedSession|PageTokensAreBoundToOperationAndNormalizedQuery)$'
   elif [[ "${scenario}" == "unmaterialized-history" ]]; then
     run_pattern='^TestUnmaterializedCreatedThreadHasEmptyHistoryUntilFirstUserMessage$'
+  elif [[ "${scenario}" == "unmaterialized-lifecycle" ]]; then
+    run_pattern='^TestUnmaterializedUnmanagedCodexMaterializesOnStartTurn$'
   elif [[ "${scenario}" == "lifecycle" ]]; then
-    run_pattern='^Test(ManagementLifecycleOverFormalWire|HandshakeV11AndGetHost|HandshakeRejectsUnsupportedMinors)$'
+    run_pattern='^Test(ManagementLifecycleOverFormalWire|HandshakeV112AndGetHost|HandshakeRejectsUnsupportedVersions)$'
+  elif [[ "${scenario}" == "rename-forget" ]]; then
+    run_pattern='^TestRenameAndForgetOverFormalWire$'
   elif [[ "${scenario}" == "workspace" ]]; then
-    run_pattern='^TestWorkspaceFormalWireScenario$'
+    run_pattern='^TestWorkspace(FormalWireScenario|ListingIsShallowAndDoesNotBlockUnrelatedRPCs)$'
   elif [[ "${scenario}" == "structured" ]]; then
     run_pattern='^TestStructuredItemsDeltasAndHistory$'
   elif [[ "${scenario}" == "failed" ]]; then

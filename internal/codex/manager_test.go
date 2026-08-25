@@ -35,6 +35,10 @@ func (r fixedAdapterRuntime) Events() <-chan adapter.Event       { return r.adap
 func (fixedAdapterRuntime) State() hostruntime.State             { return hostruntime.State{} }
 
 func restoreTestAdapter(t *testing.T) *adapter.Adapter {
+	return restoreTestAdapterWithName(t, "")
+}
+
+func restoreTestAdapterWithName(t *testing.T, threadName string) *adapter.Adapter {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "app-server.sock")
 	listener, err := net.Listen("unix", path)
@@ -59,7 +63,11 @@ func restoreTestAdapter(t *testing.T) *adapter.Adapter {
 			result := any(map[string]any{})
 			switch message.Method {
 			case "thread/read", "thread/resume":
-				result = map[string]any{"thread": map[string]any{"id": "thread", "cwd": "/tmp", "turns": []any{}}}
+				thread := map[string]any{"id": "thread", "cwd": "/tmp", "turns": []any{}}
+				if threadName != "" {
+					thread["name"] = threadName
+				}
+				result = map[string]any{"thread": thread}
 			case "turn/start":
 				result = map[string]any{"turn": map[string]any{"id": "turn", "status": "inProgress"}}
 			}
@@ -108,9 +116,28 @@ func importTestAdapter(t *testing.T, cwd string) *adapter.Adapter {
 			if json.Unmarshal(raw, &message) != nil || len(message.ID) == 0 {
 				continue
 			}
+			var params struct {
+				ThreadID string `json:"threadId"`
+			}
+			_ = json.Unmarshal(message.Params, &params)
+			if params.ThreadID == "empty-thread" && message.Method == "thread/read" {
+				response, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": message.ID, "error": map[string]any{"code": -32600, "message": "thread empty-thread" + unmaterializedIncludeTurnsSuffix}})
+				_ = conn.Write(context.Background(), websocket.MessageText, response)
+				continue
+			}
+			if params.ThreadID == "empty-thread" && message.Method == "thread/resume" {
+				response, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": message.ID, "error": map[string]any{"code": -32600, "message": unmaterializedResumePrefix + "empty-thread"}})
+				_ = conn.Write(context.Background(), websocket.MessageText, response)
+				continue
+			}
 			result := any(map[string]any{})
-			if message.Method == "thread/read" || message.Method == "thread/resume" {
-				result = map[string]any{"thread": map[string]any{"id": "historical-thread", "sessionId": "historical-thread", "cwd": cwd, "name": "historical", "source": "exec", "turns": []any{}}}
+			switch message.Method {
+			case "thread/list":
+				result = map[string]any{"data": []any{}, "nextCursor": nil}
+			case "thread/read", "thread/resume":
+				result = map[string]any{"thread": map[string]any{"id": "historical-thread", "sessionId": "historical-thread", "cwd": cwd, "name": "historical", "source": "exec", "turns": []any{map[string]any{"id": "old-turn", "status": "completed", "items": []any{}}}}}
+			case "turn/start":
+				result = map[string]any{"turn": map[string]any{"id": "turn", "status": "inProgress"}}
 			}
 			response, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": message.ID, "result": result})
 			if conn.Write(context.Background(), websocket.MessageText, response) != nil {
@@ -227,6 +254,9 @@ func TestNormalizeUnmaterializedHistoryIsNarrowlyScoped(t *testing.T) {
 	if !m.normalizeUnmaterializedHistory(c, matching) {
 		t.Fatal("managed remote-created thread before its first turn was not normalized")
 	}
+	if !m.normalizeUnmaterializedHistory(c, &adapter.RPCError{Code: -32600, Message: unmaterializedResumePrefix + c.ThreadId}) {
+		t.Fatal("known no-rollout thread before its first turn was not normalized")
+	}
 
 	tests := []struct {
 		name  string
@@ -243,6 +273,32 @@ func TestNormalizeUnmaterializedHistoryIsNarrowlyScoped(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if m.normalizeUnmaterializedHistory(tt.codex, tt.err) {
 				t.Fatal("unexpected empty-history normalization")
+			}
+		})
+	}
+}
+
+func TestNormalizeUnmaterializedResumeIsNarrowlyScoped(t *testing.T) {
+	m := testManager(t)
+	remoteCreated := &remotev1.Codex{ThreadId: "thread", Origin: remotev1.CodexOrigin_CODEX_ORIGIN_REMOTE_CREATED}
+	matching := &adapter.RPCError{Code: -32600, Message: unmaterializedResumePrefix + "thread"}
+	tests := []struct {
+		name  string
+		codex *remotev1.Codex
+		err   error
+		want  bool
+	}{
+		{name: "exact unmaterialized remote-created", codex: remoteCreated, err: matching, want: true},
+		{name: "imported session", codex: &remotev1.Codex{ThreadId: "thread", Origin: remotev1.CodexOrigin_CODEX_ORIGIN_LOCAL_EXISTING}, err: matching},
+		{name: "different code", codex: remoteCreated, err: &adapter.RPCError{Code: -32601, Message: matching.Message}},
+		{name: "different message", codex: remoteCreated, err: &adapter.RPCError{Code: -32600, Message: "other invalid request"}},
+		{name: "different thread", codex: remoteCreated, err: &adapter.RPCError{Code: -32600, Message: unmaterializedResumePrefix + "other"}},
+		{name: "ordinary error", codex: remoteCreated, err: errors.New("no rollout found")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := m.normalizeUnmaterializedResume(tt.codex, tt.err); got != tt.want {
+				t.Fatalf("normalizeUnmaterializedResume=%v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -1539,5 +1595,193 @@ func TestLargeApprovalBoundingIsSubquadraticAndDoesNotBlockNextPending(t *testin
 	}
 	if len(large.GetApproval().Command) == 0 || large.GetApproval().ApprovalId != "large" {
 		t.Fatalf("large approval lost actionable identity: %+v", large)
+	}
+}
+
+func TestRenameCodexAllowsBusyAndAllManagementStatesAndProtectsManualTitle(t *testing.T) {
+	m := testManager(t)
+	ctx := context.Background()
+	states := []remotev1.ManagementState{
+		remotev1.ManagementState_MANAGEMENT_STATE_MANAGED,
+		remotev1.ManagementState_MANAGEMENT_STATE_EXPIRING_SOON,
+		remotev1.ManagementState_MANAGEMENT_STATE_UNMANAGED,
+	}
+	for i, state := range states {
+		m.mu.Lock()
+		m.byID["c"].Codex.ManagementState = state
+		m.byID["c"].Codex.Status = remotev1.CodexStatus_CODEX_STATUS_RUNNING
+		m.byID["c"].Codex.ActiveTurnId = "turn"
+		m.mu.Unlock()
+		want := fmt.Sprintf("manual %d", i)
+		response, err := m.RenameCodex(ctx, &remotev1.RenameCodexRequest{CodexId: "c", Title: "  " + want + "  "})
+		if err != nil || response.GetCodex().GetTitle() != want {
+			t.Fatalf("state=%v response=%+v err=%v", state, response, err)
+		}
+	}
+	record, err := m.Persistence.GetCodex(ctx, "c")
+	if err != nil || !record.ManualTitleOverride || record.Title != "manual 2" {
+		t.Fatalf("persisted record=%+v err=%v", record, err)
+	}
+	if err = m.applyAdapterEvent(ctx, adapter.Event{Kind: adapter.EventCodexUpdated, Method: "thread/name/updated", ThreadID: "thread", Params: json.RawMessage(`{"threadId":"thread","threadName":"automatic"}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := m.lookup("c"); got.Title != "manual 2" {
+		t.Fatalf("automatic event replaced manual title: %q", got.Title)
+	}
+	m.mu.Lock()
+	m.byID["c"].Codex.ManagementState = remotev1.ManagementState_MANAGEMENT_STATE_MANAGED
+	m.mu.Unlock()
+	if err = m.persistState(ctx, m.byID["c"]); err != nil {
+		t.Fatal(err)
+	}
+	m.Runtime = fixedAdapterRuntime{adapter: restoreTestAdapterWithName(t, "automatic after restore")}
+	if err = m.Restore(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := m.lookup("c"); got.Title != "manual 2" {
+		t.Fatalf("restore replaced manual title: %q", got.Title)
+	}
+	if _, err = m.RenameCodex(ctx, &remotev1.RenameCodexRequest{CodexId: "c", Title: "  "}); err == nil {
+		t.Fatal("whitespace-only title succeeded")
+	}
+}
+
+func TestForgetCodexRequiresUnmanagedAndTerminatesWatch(t *testing.T) {
+	t.Run("managed conflict", func(t *testing.T) {
+		m := testManager(t)
+		m.byID["c"].Codex.ManagementState = remotev1.ManagementState_MANAGEMENT_STATE_MANAGED
+		_, err := m.ForgetCodex(context.Background(), &remotev1.ForgetCodexRequest{CodexId: "c"})
+		var rpc *gateway.RPCError
+		if !errors.As(err, &rpc) || rpc.Detail.GetCode() != remotev1.ErrorCode_ERROR_CODE_CONFLICT {
+			t.Fatalf("ForgetCodex error=%v", err)
+		}
+		if _, err = m.Persistence.GetCodex(context.Background(), "c"); err != nil {
+			t.Fatalf("managed record was removed: %v", err)
+		}
+	})
+
+	t.Run("unmanaged terminal removal", func(t *testing.T) {
+		m := testManager(t)
+		ctx := context.Background()
+		m.byID["c"].Codex.ManagementState = remotev1.ManagementState_MANAGEMENT_STATE_UNMANAGED
+		m.byID["c"].Codex.ManagedUntilUnixMs = 0
+		if err := m.persistState(ctx, m.byID["c"]); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.ensureWorkspace("c", "/tmp", m.byID["c"]); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.Persistence.SaveResolvedPending(ctx, "c", "pending", "approval", []byte(`{"done":true}`)); err != nil {
+			t.Fatal(err)
+		}
+		watch, err := m.Events.Watch(ctx, "c", nil, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response, err := m.ForgetCodex(ctx, &remotev1.ForgetCodexRequest{CodexId: "c"})
+		if err != nil || response.GetCodexId() != "c" {
+			t.Fatalf("response=%+v err=%v", response, err)
+		}
+		event, ok := <-watch.Events
+		if !ok || event.GetCodexForgotten() == nil {
+			t.Fatalf("terminal event=%+v open=%v", event, ok)
+		}
+		if _, ok = <-watch.Events; ok {
+			t.Fatal("watch remained open")
+		}
+		if _, err = m.lookup("c"); err == nil {
+			t.Fatal("forgotten codex remained in manager")
+		}
+		if _, err = m.Persistence.GetCodex(ctx, "c"); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("persisted codex err=%v", err)
+		}
+		if _, _, err = m.Persistence.ResolvedPending(ctx, "c", "pending"); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("resolved pending err=%v", err)
+		}
+		if candidate, candidateErr := m.Persistence.GetForgottenSession(ctx, "unknown", "thread"); candidateErr != nil || candidate.Materialized || candidate.CWD != "/tmp" {
+			t.Fatalf("forgotten candidate=%+v err=%v", candidate, candidateErr)
+		}
+		if _, _, err = m.Workspaces.State("c"); err == nil {
+			t.Fatal("workspace registry remained")
+		}
+		if _, err = m.Events.Watch(ctx, "c", nil, 1); !errors.Is(err, activity.ErrCodexNotFound) {
+			t.Fatalf("Watch after forget err=%v", err)
+		}
+	})
+}
+
+func TestForgottenUnmaterializedSessionCanBeListedImportedAndStarted(t *testing.T) {
+	m := testManager(t)
+	m.Runtime = fixedAdapterRuntime{adapter: importTestAdapter(t, "/tmp")}
+	ctx := context.Background()
+	forgotten := persistence.ForgottenSessionRecord{
+		Source: "appServer", SessionID: "empty-thread", CWD: "/tmp", Title: "empty candidate",
+		Origin: remotev1.CodexOrigin_CODEX_ORIGIN_REMOTE_CREATED.String(), CreatedAtUnixMS: 10, UpdatedAtUnixMS: 20,
+	}
+	if err := m.Persistence.UpsertForgottenSession(ctx, forgotten); err != nil {
+		t.Fatal(err)
+	}
+	listed, err := m.ListSessionCandidates(ctx, &remotev1.ListSessionCandidatesRequest{Cwd: "/tmp", Page: &remotev1.PageRequest{PageSize: 20}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var candidate *remotev1.SessionCandidate
+	for _, value := range listed.Sessions {
+		if value.SessionId == forgotten.SessionID && value.Source == forgotten.Source {
+			candidate = value
+		}
+	}
+	if candidate == nil || candidate.Availability != remotev1.SessionAvailability_SESSION_AVAILABILITY_RESUMABLE || candidate.ManagedCodexId != "" {
+		t.Fatalf("candidate=%+v listed=%+v", candidate, listed)
+	}
+	imported, err := m.ImportSession(ctx, &remotev1.ImportSessionRequest{SessionId: forgotten.SessionID, Source: forgotten.Source})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if imported.Codex == nil || imported.Codex.CodexId == "c" || imported.Codex.ThreadId != forgotten.SessionID || imported.Codex.Origin != remotev1.CodexOrigin_CODEX_ORIGIN_REMOTE_CREATED {
+		t.Fatalf("imported=%+v", imported)
+	}
+	if _, err = m.Persistence.GetForgottenSession(ctx, forgotten.Source, forgotten.SessionID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("forgotten candidate was not consumed: %v", err)
+	}
+	history, err := m.ListHistory(ctx, &remotev1.ListHistoryRequest{CodexId: imported.Codex.CodexId})
+	if err != nil || history.History == nil || len(history.History.Turns) != 0 || !history.History.HistoryComplete {
+		t.Fatalf("unmaterialized history=%+v err=%v", history, err)
+	}
+	started, err := m.StartTurn(ctx, &remotev1.StartTurnRequest{CodexId: imported.Codex.CodexId, Input: []*remotev1.UserInputPart{{Content: &remotev1.UserInputPart_Text{Text: &remotev1.TextInput{Text: "materialize"}}}}})
+	if err != nil || started.TurnId != "turn" {
+		t.Fatalf("StartTurn=%+v err=%v", started, err)
+	}
+}
+
+func TestForgottenMaterializedSessionReimportsWithHistoryAndNewCodexID(t *testing.T) {
+	m := testManager(t)
+	ctx := context.Background()
+	cwd := t.TempDir()
+	m.Runtime = fixedAdapterRuntime{adapter: importTestAdapter(t, cwd)}
+	old := &remotev1.Codex{
+		CodexId: "old-codex", ThreadId: "historical-thread", Cwd: cwd, Origin: remotev1.CodexOrigin_CODEX_ORIGIN_REMOTE_CREATED,
+		Status: remotev1.CodexStatus_CODEX_STATUS_IDLE, ManagementState: remotev1.ManagementState_MANAGEMENT_STATE_UNMANAGED,
+		CreatedAtUnixMs: 1, LastActivityAtUnixMs: 2,
+	}
+	if err := m.saveCodex(ctx, old, "exec"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.ForgetCodex(ctx, &remotev1.ForgetCodexRequest{CodexId: old.CodexId}); err != nil {
+		t.Fatal(err)
+	}
+	if candidate, err := m.Persistence.GetForgottenSession(ctx, "exec", old.ThreadId); err != nil || !candidate.Materialized {
+		t.Fatalf("forgotten candidate=%+v err=%v", candidate, err)
+	}
+	imported, err := m.ImportSession(ctx, &remotev1.ImportSessionRequest{SessionId: old.ThreadId, Source: "exec"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if imported.Codex == nil || imported.Codex.CodexId == old.CodexId || imported.Codex.ThreadId != old.ThreadId {
+		t.Fatalf("imported=%+v", imported)
+	}
+	history, err := m.ListHistory(ctx, &remotev1.ListHistoryRequest{CodexId: imported.Codex.CodexId})
+	if err != nil || history.History == nil || len(history.History.Turns) != 1 || history.History.Turns[0].TurnId != "old-turn" {
+		t.Fatalf("history=%+v err=%v", history, err)
 	}
 }

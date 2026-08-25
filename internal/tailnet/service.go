@@ -103,10 +103,19 @@ func New(cfg Config, audit AuditSink) (*Service, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = log.New(os.Stderr, "tailnet: ", log.LstdFlags)
 	}
-	return &Service{cfg: cfg, audit: audit, state: StateStopped}, nil
+	if err := configureDirectProxyPolicy(); err != nil {
+		return nil, fmt.Errorf("configure embedded tailscale direct proxy policy: %w", err)
+	}
+	s := &Service{cfg: cfg, audit: audit, state: StateStopped}
+	cfg.Logger.Printf("embedded Tailscale proxy policy: direct; process proxy environment is ignored")
+	s.record(context.Background(), "tailnet.proxy_policy", "configured", "embedded Tailscale uses direct connections", map[string]string{"policy": "direct"})
+	return s, nil
 }
 
 func (s *Service) Start(ctx context.Context) error {
+	if err := configureDirectProxyPolicy(); err != nil {
+		return s.fail(ctx, "tailnet.proxy_policy", fmt.Errorf("configure embedded tailscale direct proxy policy: %w", err))
+	}
 	s.mu.Lock()
 	if s.state != StateStopped {
 		s.mu.Unlock()

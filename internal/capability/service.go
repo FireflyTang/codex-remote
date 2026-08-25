@@ -84,7 +84,7 @@ func (s *Service) ObserveSessionSources(sources ...string) {
 }
 
 func New(maxWatches, maxPage uint32) *Service {
-	return &Service{value: &remotev1.Capabilities{FeatureIds: []string{"directories", "sessions", "history", "watch_replay", "approvals", "user_input", "interrupt", "diagnostic_audit", "management_lease", "unmanage_codex", "workspace"}, SessionSourceKinds: []string{"cli", "vscode", "exec", "appServer", "unknown"}, MaxWatchesPerConnection: maxWatches, MaxPageSize: maxPage, Workspace: DefaultWorkspaceCapabilities()}}
+	return &Service{value: &remotev1.Capabilities{FeatureIds: []string{"directories", "sessions", "history", "watch_replay", "approvals", "user_input", "interrupt", "diagnostic_audit", "management_lease", "unmanage_codex", "rename_codex", "forget_codex", "workspace"}, SessionSourceKinds: []string{"cli", "vscode", "exec", "appServer", "unknown"}, MaxWatchesPerConnection: maxWatches, MaxPageSize: maxPage, Workspace: DefaultWorkspaceCapabilities()}}
 }
 func (s *Service) Get() *remotev1.Capabilities {
 	s.mu.RLock()

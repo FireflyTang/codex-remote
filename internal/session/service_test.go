@@ -51,6 +51,17 @@ func TestDiscoverFiltersExactCWDAndSubagents(t *testing.T) {
 		t.Fatalf("sources=%v", f.sources)
 	}
 }
+func TestDiscoverAcceptsFilesystemSessionIdentity(t *testing.T) {
+	base := t.TempDir()
+	f := &fakeAdapter{page: adapter.ThreadPage{Data: []adapter.Thread{{SessionID: "rollout-only", CWD: base}}}}
+	_, page, err := (Service{Adapter: f, Directories: directory.Service{}}).Discover(context.Background(), base, "", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Data) != 1 || page.Data[0].ID != "rollout-only" || page.Data[0].SessionID != "rollout-only" {
+		t.Fatalf("page=%+v", page)
+	}
+}
 func TestImportReadsHistoryBeforeResume(t *testing.T) {
 	f := &fakeAdapter{read: adapter.Thread{ID: "t", Turns: []adapter.Turn{{ID: "old"}}}, resumed: adapter.Thread{ID: "t"}}
 	s := Service{Adapter: f}

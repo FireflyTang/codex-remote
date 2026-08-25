@@ -4,9 +4,13 @@ import (
 	"context"
 	"errors"
 	"log"
+	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"tailscale.com/net/tshttpproxy"
 )
 
 type auditCapture struct{ events []AuditEvent }
@@ -51,10 +55,45 @@ func TestReadyRequiresStartAndAuthURLIsNotAudited(t *testing.T) {
 	if shown == "" {
 		t.Fatal("auth callback not invoked")
 	}
-	if len(capture.events) != 1 || strings.Contains(capture.events[0].Message, "a-secret") {
+	if len(capture.events) != 2 || capture.events[1].Operation != "tailnet.auth_required" || strings.Contains(capture.events[1].Message, "a-secret") {
 		t.Fatalf("URL leaked to audit %+v", capture.events)
 	}
 	if !errors.Is(s.Close(), nil) {
 		t.Fatal("close")
+	}
+}
+
+func TestEmbeddedTailscaleProxyPolicyIsDirectWithoutMutatingEnvironment(t *testing.T) {
+	wantEnvironment := map[string]string{
+		"http_proxy":  "http://127.0.0.1:7897",
+		"https_proxy": "http://127.0.0.1:7897",
+		"all_proxy":   "socks5://127.0.0.1:7897",
+	}
+	for key, value := range wantEnvironment {
+		t.Setenv(key, value)
+	}
+
+	capture := new(auditCapture)
+	if _, err := New(Config{Hostname: "demo", StateDir: t.TempDir(), Logger: log.Default()}, capture); err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodGet, "https://derp.example:57991/derp", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyURL, err := tshttpproxy.ProxyFromEnvironment(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if proxyURL != nil {
+		t.Fatalf("embedded Tailscale unexpectedly selected proxy %s", proxyURL)
+	}
+	for key, want := range wantEnvironment {
+		if got := os.Getenv(key); got != want {
+			t.Fatalf("%s changed: got %q want %q", key, got, want)
+		}
+	}
+	if len(capture.events) != 1 || capture.events[0].Operation != "tailnet.proxy_policy" || capture.events[0].Metadata["policy"] != "direct" {
+		t.Fatalf("missing direct proxy policy audit: %+v", capture.events)
 	}
 }

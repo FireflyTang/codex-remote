@@ -61,6 +61,7 @@ type Manager struct {
 	byThread            map[string]string
 	bySession           map[string]string
 	sources             map[string]string
+	manualTitle         map[string]bool
 	warningDeadline     map[string]int64
 	chunks              map[string]uint64
 	workspaceChildCodex map[string]string
@@ -71,7 +72,7 @@ type Manager struct {
 }
 
 func NewManager(rt Runtime, p *persistence.Store, events *activity.Store, dirs directory.Service, caps *capability.Service, hostID, version string) *Manager {
-	m := &Manager{Runtime: rt, Persistence: p, Events: events, Directories: dirs, Capabilities: caps, HostID: hostID, HostVersion: version, StartedAt: time.Now(), MaxPage: 100, ContentBudget: 256 << 10, byID: make(map[string]*remotev1.CurrentView), byThread: make(map[string]string), bySession: make(map[string]string), sources: make(map[string]string), warningDeadline: make(map[string]int64), chunks: make(map[string]uint64)}
+	m := &Manager{Runtime: rt, Persistence: p, Events: events, Directories: dirs, Capabilities: caps, HostID: hostID, HostVersion: version, StartedAt: time.Now(), MaxPage: 100, ContentBudget: 256 << 10, byID: make(map[string]*remotev1.CurrentView), byThread: make(map[string]string), bySession: make(map[string]string), sources: make(map[string]string), manualTitle: make(map[string]bool), warningDeadline: make(map[string]int64), chunks: make(map[string]uint64)}
 	ws, _ := workspacecore.New(workspacecore.Config{})
 	m.SetWorkspaceService(ws)
 	return m
@@ -195,7 +196,9 @@ func (m *Manager) restoreLocked(ctx context.Context) error {
 		if _, err := ad.ResumeThread(ctx, r.ThreadID); err != nil {
 			return fmt.Errorf("resume managed thread %s: %w", r.ThreadID, err)
 		}
-		reconcileRestoredThreadTitle(c, thread)
+		if !r.ManualTitleOverride {
+			reconcileRestoredThreadTitle(c, thread)
+		}
 		// Active RPC correlation cannot survive a Host restart. Start from a
 		// conservative idle snapshot and only mark an upstream running turn as
 		// unavailable below.
@@ -240,6 +243,7 @@ func (m *Manager) registerRestored(r persistence.CodexRecord, view *remotev1.Cur
 	m.byThread[r.ThreadID] = r.CodexID
 	m.bySession[sessionKey(r.SessionSource, r.ThreadID)] = r.CodexID
 	m.sources[r.CodexID] = normalizeSourceString(r.SessionSource)
+	m.manualTitle[r.CodexID] = r.ManualTitleOverride
 	m.warningDeadline[r.CodexID] = r.WarningDeadlineUnixMS
 }
 
@@ -344,6 +348,29 @@ func (m *Manager) ListSessionCandidates(ctx context.Context, req *remotev1.ListS
 	out := &remotev1.ListSessionCandidatesResponse{NormalizedCwd: cwd, Page: &remotev1.PageInfo{}}
 	if p.NextCursor != nil {
 		out.Page.NextPageToken = encodePageToken(pageToken{Operation: "sessions", Query: cwd, Cursor: *p.NextCursor})
+	} else {
+		forgotten, listErr := m.Persistence.ListForgottenSessions(ctx, cwd)
+		if listErr != nil {
+			return nil, listErr
+		}
+		seen := make(map[string]struct{}, len(p.Data)+len(forgotten))
+		for _, thread := range p.Data {
+			seen[sessionKey(normalizeSource(thread.Source), thread.ID)] = struct{}{}
+		}
+		for _, candidate := range forgotten {
+			key := sessionKey(candidate.Source, candidate.SessionID)
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			rawSource, _ := json.Marshal(candidate.Source)
+			thread := adapter.Thread{ID: candidate.SessionID, SessionID: candidate.SessionID, CWD: candidate.CWD, Preview: candidate.Preview, CreatedAt: candidate.CreatedAtUnixMS, UpdatedAt: candidate.UpdatedAtUnixMS, Source: rawSource}
+			if candidate.Title != "" {
+				title := candidate.Title
+				thread.Name = &title
+			}
+			p.Data = append(p.Data, thread)
+		}
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -426,15 +453,36 @@ func (m *Manager) ImportSession(ctx context.Context, req *remotev1.ImportSession
 	if err != nil {
 		return nil, rpcErr(remotev1.ErrorCode_ERROR_CODE_RUNTIME_UNAVAILABLE, err)
 	}
-	listed, err := ad.ReadThread(ctx, req.SessionId, true)
-	if err != nil {
-		return nil, rpcErr(remotev1.ErrorCode_ERROR_CODE_SESSION_IMPORT_FAILED, err)
+	forgotten, forgottenErr := m.Persistence.GetForgottenSession(ctx, source, req.SessionId)
+	hasForgotten := forgottenErr == nil
+	if forgottenErr != nil && !errors.Is(forgottenErr, sql.ErrNoRows) {
+		return nil, forgottenErr
 	}
-	actualSource := normalizeSource(listed.Source)
-	if actualSource != source {
-		return nil, rpcErr(remotev1.ErrorCode_ERROR_CODE_SESSION_IMPORT_FAILED, fmt.Errorf("session source mismatch: requested %q, app-server returned %q", source, actualSource))
+	listed, readErr := ad.ReadThread(ctx, req.SessionId, true)
+	t := adapter.Thread{}
+	actualSource := source
+	remoteCandidate := &remotev1.Codex{ThreadId: req.SessionId, Origin: remotev1.CodexOrigin_CODEX_ORIGIN_REMOTE_CREATED}
+	switch {
+	case readErr == nil:
+		actualSource = normalizeSource(listed.Source)
+		if actualSource != source {
+			return nil, rpcErr(remotev1.ErrorCode_ERROR_CODE_SESSION_IMPORT_FAILED, fmt.Errorf("session source mismatch: requested %q, app-server returned %q", source, actualSource))
+		}
+		t, err = (session.Service{Adapter: ad, Directories: m.Directories}).Import(ctx, req.SessionId)
+	case hasForgotten && !forgotten.Materialized && strings.Contains(forgotten.Origin, "REMOTE_CREATED") && (m.normalizeUnmaterializedHistory(remoteCandidate, readErr) || m.normalizeUnmaterializedResume(remoteCandidate, readErr)):
+		t = threadFromForgotten(forgotten)
+		if _, resumeErr := ad.ResumeThread(ctx, req.SessionId); resumeErr != nil && !m.normalizeUnmaterializedResume(remoteCandidate, resumeErr) {
+			return nil, rpcErr(remotev1.ErrorCode_ERROR_CODE_SESSION_IMPORT_FAILED, resumeErr)
+		}
+	case hasForgotten && !forgotten.Materialized && strings.Contains(forgotten.Origin, "REMOTE_CREATED") && forgottenSessionNotFound(readErr):
+		t, _, err = (session.Service{Adapter: ad, Directories: m.Directories}).Create(ctx, forgotten.CWD, false)
+		if err == nil && len(t.Source) == 0 {
+			t.Source, _ = json.Marshal(source)
+		}
+		actualSource = normalizeSource(t.Source)
+	default:
+		return nil, rpcErr(remotev1.ErrorCode_ERROR_CODE_SESSION_IMPORT_FAILED, readErr)
 	}
-	t, err := (session.Service{Adapter: ad, Directories: m.Directories}).Import(ctx, req.SessionId)
 	if err != nil {
 		return nil, rpcErr(remotev1.ErrorCode_ERROR_CODE_SESSION_IMPORT_FAILED, err)
 	}
@@ -458,12 +506,21 @@ func (m *Manager) ImportSession(ctx context.Context, req *remotev1.ImportSession
 		title = *t.Name
 	}
 	now := m.now()
-	c := &remotev1.Codex{CodexId: newID("cdx"), ThreadId: t.ID, Cwd: t.CWD, Title: title, Origin: remotev1.CodexOrigin_CODEX_ORIGIN_LOCAL_EXISTING, Status: remotev1.CodexStatus_CODEX_STATUS_IDLE, ManagementState: remotev1.ManagementState_MANAGEMENT_STATE_MANAGED, ManagedUntilUnixMs: now.Add(m.leaseDuration()).UnixMilli(), CreatedAtUnixMs: unixMillis(t.CreatedAt), ImportedAtUnixMs: now.UnixMilli(), LastActivityAtUnixMs: now.UnixMilli()}
+	origin := remotev1.CodexOrigin_CODEX_ORIGIN_LOCAL_EXISTING
+	if hasForgotten && strings.Contains(forgotten.Origin, "REMOTE_CREATED") {
+		origin = remotev1.CodexOrigin_CODEX_ORIGIN_REMOTE_CREATED
+	}
+	c := &remotev1.Codex{CodexId: newID("cdx"), ThreadId: t.ID, Cwd: t.CWD, Title: title, Origin: origin, Status: remotev1.CodexStatus_CODEX_STATUS_IDLE, ManagementState: remotev1.ManagementState_MANAGEMENT_STATE_MANAGED, ManagedUntilUnixMs: now.Add(m.leaseDuration()).UnixMilli(), CreatedAtUnixMs: unixMillis(t.CreatedAt), ImportedAtUnixMs: now.UnixMilli(), LastActivityAtUnixMs: now.UnixMilli()}
 	if err = m.saveCodex(ctx, c, actualSource); err != nil {
 		return nil, err
 	}
 	if err = m.publishCodex(ctx, c, gateway.RequestIDFromContext(ctx)); err != nil {
 		return nil, err
+	}
+	if hasForgotten {
+		if err = m.Persistence.DeleteForgottenSession(ctx, source, req.SessionId); err != nil {
+			return nil, err
+		}
 	}
 	return &remotev1.ImportSessionResponse{Codex: c, HistoryComplete: true}, nil
 }
@@ -526,7 +583,9 @@ func (m *Manager) StartTurn(ctx context.Context, req *remotev1.StartTurnRequest)
 	}
 	if c.ManagementState == remotev1.ManagementState_MANAGEMENT_STATE_UNMANAGED {
 		if _, err = ad.ResumeThread(ctx, c.ThreadId); err != nil {
-			return nil, err
+			if !m.normalizeUnmaterializedResume(c, err) {
+				return nil, err
+			}
 		}
 	}
 	var input []adapter.TextInput
@@ -604,6 +663,107 @@ func (m *Manager) UnmanageCodex(ctx context.Context, req *remotev1.UnmanageCodex
 		return nil, m.rollbackLifecycleState(ctx, req.CodexId, original, oldWarning, err)
 	}
 	return &remotev1.UnmanageCodexResponse{Codex: proto.Clone(snapshot.Codex).(*remotev1.Codex)}, nil
+}
+
+func (m *Manager) RenameCodex(ctx context.Context, req *remotev1.RenameCodexRequest) (*remotev1.RenameCodexResponse, error) {
+	if req == nil || req.CodexId == "" {
+		return nil, rpcErr(remotev1.ErrorCode_ERROR_CODE_INVALID_REQUEST, errors.New("codex id is required"))
+	}
+	title := strings.TrimSpace(req.Title)
+	if title == "" {
+		return nil, rpcErr(remotev1.ErrorCode_ERROR_CODE_INVALID_REQUEST, errors.New("title is required"))
+	}
+	m.commitMu.Lock()
+	defer m.commitMu.Unlock()
+	m.mu.Lock()
+	m.ensureMapsLocked()
+	view := m.byID[req.CodexId]
+	if view == nil || view.Codex == nil {
+		m.mu.Unlock()
+		return nil, rpcErr(remotev1.ErrorCode_ERROR_CODE_CODEX_NOT_FOUND, errors.New("codex not found"))
+	}
+	snapshot := proto.Clone(view).(*remotev1.CurrentView)
+	snapshot.Codex.Title = title
+	snapshot.GeneratedAtUnixMs = m.now().UnixMilli()
+	oldManualTitle := m.manualTitle[req.CodexId]
+	m.manualTitle[req.CodexId] = true
+	m.mu.Unlock()
+	if err := m.persistState(ctx, snapshot); err != nil {
+		m.mu.Lock()
+		m.manualTitle[req.CodexId] = oldManualTitle
+		m.mu.Unlock()
+		return nil, err
+	}
+	m.mu.Lock()
+	m.byID[req.CodexId] = snapshot
+	m.mu.Unlock()
+	if err := m.publishCodex(ctx, snapshot.Codex, gateway.RequestIDFromContext(ctx)); err != nil {
+		return nil, err
+	}
+	return &remotev1.RenameCodexResponse{Codex: proto.Clone(snapshot.Codex).(*remotev1.Codex)}, nil
+}
+
+func (m *Manager) ForgetCodex(ctx context.Context, req *remotev1.ForgetCodexRequest) (*remotev1.ForgetCodexResponse, error) {
+	if req == nil || req.CodexId == "" {
+		return nil, rpcErr(remotev1.ErrorCode_ERROR_CODE_INVALID_REQUEST, errors.New("codex id is required"))
+	}
+	m.commitMu.Lock()
+	defer m.commitMu.Unlock()
+	m.mu.RLock()
+	view := m.byID[req.CodexId]
+	if view == nil || view.Codex == nil {
+		m.mu.RUnlock()
+		return nil, rpcErr(remotev1.ErrorCode_ERROR_CODE_CODEX_NOT_FOUND, errors.New("codex not found"))
+	}
+	codex := proto.Clone(view.Codex).(*remotev1.Codex)
+	source := m.sources[req.CodexId]
+	m.mu.RUnlock()
+	if codex.ManagementState != remotev1.ManagementState_MANAGEMENT_STATE_UNMANAGED {
+		return nil, rpcErr(remotev1.ErrorCode_ERROR_CODE_CONFLICT, errors.New("codex must be unmanaged before it can be forgotten"))
+	}
+	materialized := false
+	if m.Runtime != nil {
+		if ad, adapterErr := m.Runtime.Adapter(); adapterErr == nil {
+			_, readErr := ad.ReadThread(ctx, codex.ThreadId, true)
+			materialized = readErr == nil
+		}
+	}
+	if err := m.Persistence.UpsertForgottenSession(ctx, persistence.ForgottenSessionRecord{
+		Source: source, SessionID: codex.ThreadId, CWD: codex.Cwd, Title: codex.Title, Origin: codex.Origin.String(),
+		CreatedAtUnixMS: codex.CreatedAtUnixMs, UpdatedAtUnixMS: codex.LastActivityAtUnixMs, Materialized: materialized,
+	}); err != nil {
+		return nil, err
+	}
+	if _, err := m.Events.Forget(ctx, req.CodexId, gateway.RequestIDFromContext(ctx), m.Persistence.DeleteCodex); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	delete(m.byID, req.CodexId)
+	if m.byThread[codex.ThreadId] == req.CodexId {
+		delete(m.byThread, codex.ThreadId)
+	}
+	if key := sessionKey(source, codex.ThreadId); m.bySession[key] == req.CodexId {
+		delete(m.bySession, key)
+	}
+	delete(m.sources, req.CodexId)
+	delete(m.manualTitle, req.CodexId)
+	delete(m.warningDeadline, req.CodexId)
+	for key := range m.chunks {
+		if strings.HasPrefix(key, req.CodexId+"\x00") {
+			delete(m.chunks, key)
+		}
+	}
+	for child, codexID := range m.workspaceChildCodex {
+		if codexID == req.CodexId {
+			delete(m.workspaceChildCodex, child)
+			delete(m.workspaceChildState, child)
+		}
+	}
+	m.mu.Unlock()
+	if m.Workspaces != nil {
+		m.Workspaces.Unregister(req.CodexId)
+	}
+	return &remotev1.ForgetCodexResponse{CodexId: req.CodexId}, nil
 }
 
 func manualUnmanageBusy(view *remotev1.CurrentView) bool {
@@ -960,6 +1120,7 @@ func (m *Manager) saveCodex(ctx context.Context, c *remotev1.Codex, source strin
 	m.byThread[c.ThreadId] = c.CodexId
 	m.bySession[sessionKey(source, c.ThreadId)] = c.CodexId
 	m.sources[c.CodexId] = source
+	m.manualTitle[c.CodexId] = false
 	m.warningDeadline[c.CodexId] = 0
 	m.mu.Unlock()
 	return nil
@@ -975,16 +1136,30 @@ func (m *Manager) lookup(id string) (*remotev1.Codex, error) {
 }
 
 const unmaterializedIncludeTurnsSuffix = " is not materialized yet; includeTurns is unavailable before first user message"
+const unmaterializedResumePrefix = "no rollout found for thread id "
+
+func (m *Manager) normalizeUnmaterializedResume(c *remotev1.Codex, err error) bool {
+	if c == nil || c.Origin != remotev1.CodexOrigin_CODEX_ORIGIN_REMOTE_CREATED {
+		return false
+	}
+	var rpc *adapter.RPCError
+	return errors.As(err, &rpc) && rpc.Code == -32600 && rpc.Message == unmaterializedResumePrefix+c.ThreadId
+}
+
+func forgottenSessionNotFound(err error) bool {
+	var rpc *adapter.RPCError
+	return errors.As(err, &rpc) && rpc.Code == -32004 && strings.EqualFold(strings.TrimSpace(rpc.Message), "thread not found")
+}
 
 func (m *Manager) normalizeUnmaterializedHistory(c *remotev1.Codex, err error) bool {
 	if c == nil || c.Origin != remotev1.CodexOrigin_CODEX_ORIGIN_REMOTE_CREATED {
 		return false
 	}
 	var rpc *adapter.RPCError
-	if !errors.As(err, &rpc) || rpc.Code != -32600 || rpc.Message != "thread "+c.ThreadId+unmaterializedIncludeTurnsSuffix {
+	if !errors.As(err, &rpc) || rpc.Code != -32600 {
 		return false
 	}
-	return true
+	return rpc.Message == "thread "+c.ThreadId+unmaterializedIncludeTurnsSuffix || rpc.Message == unmaterializedResumePrefix+c.ThreadId
 }
 func (m *Manager) persistView(ctx context.Context, id string, v *remotev1.CurrentView) error {
 	raw, err := protojson.Marshal(v)
@@ -1004,8 +1179,10 @@ func (m *Manager) persistState(ctx context.Context, v *remotev1.CurrentView) err
 	m.mu.RLock()
 	source := m.sources[v.Codex.CodexId]
 	warningDeadline := m.warningDeadline[v.Codex.CodexId]
+	manualTitleOverride := m.manualTitle[v.Codex.CodexId]
 	m.mu.RUnlock()
 	r := recordFromCodex(v.Codex, source)
+	r.ManualTitleOverride = manualTitleOverride
 	r.WarningDeadlineUnixMS = warningDeadline
 	r.CurrentViewJSON = raw
 	return m.Persistence.UpsertCodex(ctx, r)
@@ -1215,7 +1392,11 @@ func (m *Manager) applyAdapterEventLocked(ctx context.Context, e adapter.Event) 
 	ev := &remotev1.Event{CodexId: id, OccurredAtUnixMs: now}
 	switch e.Kind {
 	case adapter.EventCodexUpdated:
+		preservedTitle := view.Codex.Title
 		applyCodexParams(view.Codex, e.Method, e.Params)
+		if m.manualTitle[id] {
+			view.Codex.Title = preservedTitle
+		}
 		view.Codex.LastActivityAtUnixMs = now
 		ev.Event = &remotev1.Event_CodexUpdated{CodexUpdated: &remotev1.CodexUpdated{Codex: proto.Clone(view.Codex).(*remotev1.Codex)}}
 	case adapter.EventTurnUpdated:
@@ -1706,6 +1887,15 @@ func turnStatus(v string) remotev1.TurnStatus {
 func recordFromCodex(c *remotev1.Codex, source string) persistence.CodexRecord {
 	return persistence.CodexRecord{CodexID: c.CodexId, ThreadID: c.ThreadId, SessionSource: normalizeSourceString(source), CWD: c.Cwd, Title: c.Title, Origin: c.Origin.String(), Status: c.Status.String(), ActiveTurnID: c.ActiveTurnId, ManagementState: c.ManagementState.String(), ManagedUntilUnixMS: c.ManagedUntilUnixMs, CreatedAtUnixMS: c.CreatedAtUnixMs, ImportedAtUnixMS: c.ImportedAtUnixMs, LastActivityAtUnixMS: c.LastActivityAtUnixMs}
 }
+func threadFromForgotten(r persistence.ForgottenSessionRecord) adapter.Thread {
+	rawSource, _ := json.Marshal(normalizeSourceString(r.Source))
+	t := adapter.Thread{ID: r.SessionID, SessionID: r.SessionID, CWD: r.CWD, Preview: r.Preview, CreatedAt: r.CreatedAtUnixMS, UpdatedAt: r.UpdatedAtUnixMS, Source: rawSource}
+	if r.Title != "" {
+		title := r.Title
+		t.Name = &title
+	}
+	return t
+}
 func codexFromRecord(r persistence.CodexRecord) *remotev1.Codex {
 	origin := remotev1.CodexOrigin_CODEX_ORIGIN_REMOTE_CREATED
 	if strings.Contains(r.Origin, "LOCAL_EXISTING") {
@@ -1806,6 +1996,9 @@ func (m *Manager) ensureMapsLocked() {
 	}
 	if m.sources == nil {
 		m.sources = make(map[string]string)
+	}
+	if m.manualTitle == nil {
+		m.manualTitle = make(map[string]bool)
 	}
 	if m.warningDeadline == nil {
 		m.warningDeadline = make(map[string]int64)

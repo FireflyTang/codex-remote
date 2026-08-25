@@ -294,3 +294,63 @@ func TestResolvedPendingTombstonePersists(t *testing.T) {
 		t.Fatalf("kind=%q raw=%s err=%v", kind, raw, err)
 	}
 }
+
+func TestManualTitleAndForgetRemoveCodexStateButKeepDedup(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	record := CodexRecord{CodexID: "forget-me", ThreadID: "thread", CWD: "/tmp", Title: "manual", Origin: "remote", Status: "idle", CreatedAtUnixMS: 1, LastActivityAtUnixMS: 1, ManualTitleOverride: true}
+	if err = s.UpsertCodex(ctx, record); err != nil {
+		t.Fatal(err)
+	}
+	if got, getErr := s.GetCodex(ctx, record.CodexID); getErr != nil || !got.ManualTitleOverride {
+		t.Fatalf("manual override=%v err=%v", got.ManualTitleOverride, getErr)
+	}
+	if _, err = s.NextEventSequence(ctx, record.CodexID); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.SaveResolvedPending(ctx, record.CodexID, "pending", "approval", []byte(`{"resolved":true}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.BeginRequest(ctx, "request", "ForgetCodex", []byte("fingerprint")); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.CompleteRequest(ctx, "request", []byte(`{"forgotten":true}`)); err != nil {
+		t.Fatal(err)
+	}
+	forgotten := ForgottenSessionRecord{Source: "appServer", SessionID: "thread", CWD: "/tmp", Title: "candidate", Origin: "CODEX_ORIGIN_REMOTE_CREATED", CreatedAtUnixMS: 1, UpdatedAtUnixMS: 2}
+	if err = s.UpsertForgottenSession(ctx, forgotten); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.DeleteCodex(ctx, record.CodexID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.GetCodex(ctx, record.CodexID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetCodex after delete err=%v", err)
+	}
+	if head, headErr := s.EventHead(ctx, record.CodexID); headErr != nil || head != 0 {
+		t.Fatalf("event head=%d err=%v", head, headErr)
+	}
+	if _, _, err = s.ResolvedPending(ctx, record.CodexID, "pending"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("resolved pending err=%v", err)
+	}
+	if got, dedupErr := s.BeginRequest(ctx, "request", "ForgetCodex", []byte("fingerprint")); dedupErr != nil || got.State != DedupCompleted {
+		t.Fatalf("dedup state=%v err=%v", got.State, dedupErr)
+	}
+	if got, getErr := s.GetForgottenSession(ctx, forgotten.Source, forgotten.SessionID); getErr != nil || got.Title != forgotten.Title || got.Materialized {
+		t.Fatalf("forgotten candidate=%+v err=%v", got, getErr)
+	}
+	listed, listErr := s.ListForgottenSessions(ctx, forgotten.CWD)
+	if listErr != nil || len(listed) != 1 || listed[0].SessionID != forgotten.SessionID {
+		t.Fatalf("forgotten list=%+v err=%v", listed, listErr)
+	}
+	if err = s.DeleteForgottenSession(ctx, forgotten.Source, forgotten.SessionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.GetForgottenSession(ctx, forgotten.Source, forgotten.SessionID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("forgotten candidate after consume err=%v", err)
+	}
+}

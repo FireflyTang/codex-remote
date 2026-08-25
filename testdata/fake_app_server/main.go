@@ -124,6 +124,13 @@ func (f *fixture) handle(req message, write func(any)) {
 		f.mu.Lock()
 		data := make([]map[string]any, 0, len(f.threads))
 		for _, thread := range f.threads {
+			turns, _ := thread["turns"].([]any)
+			if f.scenario == "rename-forget" && len(turns) == 0 {
+				// Real app-server discovery has no rollout to return before the
+				// first user message. The Host must retain enough forgotten-session
+				// metadata to surface this candidate itself.
+				continue
+			}
 			if p.CWD == "" || thread["cwd"] == p.CWD {
 				data = append(data, thread)
 			}
@@ -180,6 +187,10 @@ func (f *fixture) handle(req message, write func(any)) {
 		f.mu.Unlock()
 		if thread == nil {
 			write(map[string]any{"jsonrpc": "2.0", "id": req.ID, "error": map[string]any{"code": -32004, "message": "thread not found"}})
+			return
+		}
+		if (f.scenario == "unmaterialized-lifecycle" || f.scenario == "rename-forget") && len(turns) == 0 {
+			write(map[string]any{"jsonrpc": "2.0", "id": req.ID, "error": map[string]any{"code": -32600, "message": "no rollout found for thread id " + p.ThreadID}})
 			return
 		}
 		if req.Method == "thread/read" && p.IncludeTurns && len(turns) == 0 && historyReadError != "" {
@@ -258,6 +269,9 @@ func (f *fixture) emitTurn(write func(any), threadID, turnID string) {
 			})
 			return
 		}
+	}
+	if f.scenario == "rename-forget" && filepath.Base(f.threadCWD(threadID)) == "rename-running" {
+		return
 	}
 	switch f.scenario {
 	case "interrupt":

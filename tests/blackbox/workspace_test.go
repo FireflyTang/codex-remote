@@ -3,14 +3,142 @@ package blackbox_test
 import (
 	"archive/zip"
 	"bytes"
+	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"syscall"
 	"testing"
+	"time"
 
 	remotev1 "github.com/FireflyTang/codex-remote-protocol/gen/go/codex/remote/v1"
 )
+
+func TestWorkspaceListingIsShallowAndDoesNotBlockUnrelatedRPCs(t *testing.T) {
+	requireScenario(t, "workspace")
+	root := filepath.Join(testWorkspace(t), "workspace-shallow-list")
+	deep := filepath.Join(root, "deep")
+	leaf := filepath.Join(deep, "branch", "leaf.txt")
+	if err := os.MkdirAll(filepath.Dir(leaf), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(leaf, []byte("first"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	setup := dial(t)
+	setup.hello(t)
+	created := setup.request(t, request("workspace-shallow-create", &remotev1.Request_CreateCodex{CreateCodex: &remotev1.CreateCodexRequest{
+		Cwd: root, Title: "workspace shallow listing",
+	}})).GetCreateCodex()
+	if created == nil || created.Codex == nil || created.Codex.CodexId == "" {
+		t.Fatalf("CreateCodex=%+v", created)
+	}
+	codexID := created.Codex.CodexId
+
+	// Keep the formal wire fixture small. Precise descendant-I/O detection lives
+	// in the workspace package test; here we only exercise the public behavior.
+	for directory := 0; directory < 3; directory++ {
+		dir := filepath.Join(deep, "load", fmt.Sprintf("d-%03d", directory))
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		for file := 0; file < 4; file++ {
+			if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("f-%03d", file)), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	t.Run("list is shallow and bounded", func(t *testing.T) {
+		quick := dial(t)
+		quick.hello(t)
+		response := requestWithin(t, quick, request("workspace-shallow-bounded-list", &remotev1.Request_ListWorkspaceEntries{ListWorkspaceEntries: &remotev1.ListWorkspaceEntriesRequest{
+			CodexId: codexID, Page: &remotev1.PageRequest{PageSize: 3},
+		}}), 500*time.Millisecond)
+		listed := requireListWorkspace(t, response)
+		if got := workspaceEntryNames(listed.Entries); !equalStrings(got, []string{"deep"}) {
+			t.Fatalf("root listing must contain only direct children: got %v", got)
+		}
+		if len(listed.Entries) != 1 || listed.Entries[0].Kind != remotev1.WorkspaceEntryKind_WORKSPACE_ENTRY_KIND_DIRECTORY || listed.Entries[0].Revision != "" {
+			t.Fatalf("listed directory must have an empty revision: %+v", listed.Entries)
+		}
+	})
+
+	t.Run("list does not monopolize workspace or create", func(t *testing.T) {
+		listClient, getClient, createClient := dial(t), dial(t), dial(t)
+		listClient.hello(t)
+		getClient.hello(t)
+		createClient.hello(t)
+
+		listRequest := request("workspace-shallow-concurrent-list", &remotev1.Request_ListWorkspaceEntries{ListWorkspaceEntries: &remotev1.ListWorkspaceEntriesRequest{
+			CodexId: codexID, Page: &remotev1.PageRequest{PageSize: 3},
+		}})
+		type result struct {
+			response *remotev1.Response
+			err      error
+		}
+		listed := make(chan result, 1)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			response, err := listClient.requestContext(ctx, listRequest)
+			listed <- result{response: response, err: err}
+		}()
+		// Let the Host enter the list handler before exercising the operations
+		// that used to queue behind its global workspace mutex.
+		time.Sleep(20 * time.Millisecond)
+
+		getResponse := requestWithin(t, getClient, request("workspace-shallow-concurrent-get", &remotev1.Request_GetWorkspace{GetWorkspace: &remotev1.GetWorkspaceRequest{CodexId: codexID}}), 750*time.Millisecond)
+		if getResponse.GetError() != nil || getResponse.GetGetWorkspace() == nil {
+			t.Fatalf("concurrent GetWorkspace=%+v", getResponse)
+		}
+		otherRoot := filepath.Join(testWorkspace(t), "workspace-shallow-create-other")
+		createResponse := requestWithin(t, createClient, request("workspace-shallow-concurrent-create", &remotev1.Request_CreateCodex{CreateCodex: &remotev1.CreateCodexRequest{
+			Cwd: otherRoot, CreateDirectoryIfMissing: true, Title: "workspace create while listing",
+		}}), 750*time.Millisecond)
+		if createResponse.GetError() != nil || createResponse.GetCreateCodex() == nil || createResponse.GetCreateCodex().Codex == nil {
+			t.Fatalf("concurrent CreateCodex=%+v", createResponse)
+		}
+
+		listResult := <-listed
+		if listResult.err != nil {
+			t.Fatalf("ListWorkspaceEntries did not reach a terminal response: %v", listResult.err)
+		}
+		if listResult.response.GetError() != nil || listResult.response.GetListWorkspaceEntries() == nil {
+			t.Fatalf("concurrent ListWorkspaceEntries=%+v", listResult.response)
+		}
+	})
+
+	t.Run("disconnect does not poison subsequent requests", func(t *testing.T) {
+		cancelled := dial(t)
+		cancelled.hello(t)
+		cancelled.writeFrame(t, &remotev1.Frame{Payload: &remotev1.Frame_Request{Request: request("workspace-shallow-disconnected-list", &remotev1.Request_ListWorkspaceEntries{ListWorkspaceEntries: &remotev1.ListWorkspaceEntriesRequest{
+			CodexId: codexID, Page: &remotev1.PageRequest{PageSize: 3},
+		}})}})
+		_ = cancelled.conn.CloseNow()
+
+		after := dial(t)
+		after.hello(t)
+		response := requestWithin(t, after, request("workspace-shallow-after-disconnect", &remotev1.Request_GetWorkspace{GetWorkspace: &remotev1.GetWorkspaceRequest{CodexId: codexID}}), 750*time.Millisecond)
+		if response.GetError() != nil || response.GetGetWorkspace() == nil {
+			t.Fatalf("GetWorkspace after disconnected ListWorkspaceEntries=%+v", response)
+		}
+	})
+}
+
+func requestWithin(t *testing.T, c *wireClient, request *remotev1.Request, timeout time.Duration) *remotev1.Response {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	response, err := c.requestContext(ctx, request)
+	if err != nil {
+		t.Fatalf("request_id=%q did not reach a terminal response within %s: %v", request.RequestId, timeout, err)
+	}
+	return response
+}
 
 func TestWorkspaceFormalWireScenario(t *testing.T) {
 	requireScenario(t, "workspace")
@@ -135,14 +263,21 @@ func TestWorkspaceFormalWireScenario(t *testing.T) {
 	if got, want := names, []string{"a.txt", "b.txt", "c.txt", "d.txt"}; !equalStrings(got, want) {
 		t.Fatalf("paged workspace names=%v, want %v", got, want)
 	}
+	for _, entry := range append(append([]*remotev1.WorkspaceEntry{}, firstPage.Entries...), secondPage.Entries...) {
+		if entry == nil || entry.Kind != remotev1.WorkspaceEntryKind_WORKSPACE_ENTRY_KIND_REGULAR_FILE || entry.Revision == "" {
+			t.Fatalf("listed regular file must have a non-empty revision: %+v", entry)
+		}
+	}
 
 	regularContent := []byte{0x00, 0x01, 0xff, 0x02}
 	uploadRegular := request("workspace-upload-replay", &remotev1.Request_UploadWorkspaceEntry{UploadWorkspaceEntry: &remotev1.UploadWorkspaceEntryRequest{
 		CodexId: codexID, DestinationPath: "uploads/blob.bin", Kind: remotev1.WorkspaceUploadKind_WORKSPACE_UPLOAD_KIND_REGULAR_FILE,
-		Content: regularContent, Condition: remotev1.WorkspaceWriteCondition_WORKSPACE_WRITE_CONDITION_CREATE_ONLY,
-		ExpectedQuiescenceToken: state.AccessState.QuiescenceToken,
+		Content: regularContent, ExpectedQuiescenceToken: state.AccessState.QuiescenceToken,
 	}})
 	uploaded := requireUpload(t, c.request(t, uploadRegular))
+	if uploaded.Entry.Kind != remotev1.WorkspaceEntryKind_WORKSPACE_ENTRY_KIND_REGULAR_FILE || uploaded.Entry.Revision == "" {
+		t.Fatalf("regular upload must return a non-empty revision: %+v", uploaded)
+	}
 	state.AccessState = syncWorkspaceMutation(t, c, codexID, state.AccessState.Generation, "workspace-get-after-upload")
 	replayedUpload := requireUpload(t, c.request(t, uploadRegular))
 	if !replayedUpload.Deduplicated || replayedUpload.Entry.Revision != uploaded.Entry.Revision {
@@ -150,62 +285,111 @@ func TestWorkspaceFormalWireScenario(t *testing.T) {
 	}
 	expectWorkspaceError(t, c.request(t, request("workspace-upload-replay", &remotev1.Request_UploadWorkspaceEntry{UploadWorkspaceEntry: &remotev1.UploadWorkspaceEntryRequest{
 		CodexId: codexID, DestinationPath: "uploads/other.bin", Kind: remotev1.WorkspaceUploadKind_WORKSPACE_UPLOAD_KIND_REGULAR_FILE,
-		Content: []byte("different"), Condition: remotev1.WorkspaceWriteCondition_WORKSPACE_WRITE_CONDITION_CREATE_ONLY,
-		ExpectedQuiescenceToken: state.AccessState.QuiescenceToken,
+		Content: []byte("different"), ExpectedQuiescenceToken: state.AccessState.QuiescenceToken,
 	}})), remotev1.ErrorCode_ERROR_CODE_CONFLICT)
+
+	replacementContent := []byte{0x03, 0x04, 0xfe, 0x05}
+	replacedRegular := requireUpload(t, c.request(t, request("workspace-upload-replace-regular", &remotev1.Request_UploadWorkspaceEntry{UploadWorkspaceEntry: &remotev1.UploadWorkspaceEntryRequest{
+		CodexId: codexID, DestinationPath: "uploads/blob.bin", Kind: remotev1.WorkspaceUploadKind_WORKSPACE_UPLOAD_KIND_REGULAR_FILE,
+		Content: replacementContent, ExpectedQuiescenceToken: state.AccessState.QuiescenceToken,
+	}})))
+	if replacedRegular.Entry.Revision == "" || replacedRegular.Entry.Revision == uploaded.Entry.Revision {
+		t.Fatalf("same-kind regular upload did not replace the target: before=%+v after=%+v", uploaded.Entry, replacedRegular.Entry)
+	}
+	state.AccessState = syncWorkspaceMutation(t, c, codexID, state.AccessState.Generation, "workspace-get-after-regular-replace")
+
+	archive := makeWorkspaceZIP(t, map[string][]byte{"top.txt": []byte("top"), "nested/inside.txt": []byte("inside")}, []string{"empty/"})
+	replacedWithDirectory := requireUpload(t, c.request(t, request("workspace-upload-regular-to-directory", &remotev1.Request_UploadWorkspaceEntry{UploadWorkspaceEntry: &remotev1.UploadWorkspaceEntryRequest{
+		CodexId: codexID, DestinationPath: "uploads/blob.bin", Kind: remotev1.WorkspaceUploadKind_WORKSPACE_UPLOAD_KIND_ZIP_DIRECTORY,
+		Content: archive, ExpectedQuiescenceToken: state.AccessState.QuiescenceToken,
+	}})))
+	if replacedWithDirectory.Entry.Kind != remotev1.WorkspaceEntryKind_WORKSPACE_ENTRY_KIND_DIRECTORY || replacedWithDirectory.Entry.Revision != "" {
+		t.Fatalf("regular-to-directory replacement=%+v", replacedWithDirectory)
+	}
+	state.AccessState = syncWorkspaceMutation(t, c, codexID, state.AccessState.Generation, "workspace-get-after-regular-to-directory")
+	downloadedReplacementDirectory := requireDownload(t, c.request(t, request("workspace-download-replaced-directory", &remotev1.Request_DownloadWorkspaceEntry{DownloadWorkspaceEntry: &remotev1.DownloadWorkspaceEntryRequest{CodexId: codexID, RelativePath: "uploads/blob.bin"}})))
+	if downloadedReplacementDirectory.Kind != remotev1.WorkspaceDownloadKind_WORKSPACE_DOWNLOAD_KIND_ZIP_DIRECTORY || downloadedReplacementDirectory.Entry.Revision != "" {
+		t.Fatalf("replaced directory download=%+v", downloadedReplacementDirectory)
+	}
+
+	finalRegularContent := []byte{0x06, 0x07, 0xfd, 0x08}
+	replacedWithRegular := requireUpload(t, c.request(t, request("workspace-upload-directory-to-regular", &remotev1.Request_UploadWorkspaceEntry{UploadWorkspaceEntry: &remotev1.UploadWorkspaceEntryRequest{
+		CodexId: codexID, DestinationPath: "uploads/blob.bin", Kind: remotev1.WorkspaceUploadKind_WORKSPACE_UPLOAD_KIND_REGULAR_FILE,
+		Content: finalRegularContent, ExpectedQuiescenceToken: state.AccessState.QuiescenceToken,
+	}})))
+	if replacedWithRegular.Entry.Kind != remotev1.WorkspaceEntryKind_WORKSPACE_ENTRY_KIND_REGULAR_FILE || replacedWithRegular.Entry.Revision == "" {
+		t.Fatalf("directory-to-regular replacement=%+v", replacedWithRegular)
+	}
+	state.AccessState = syncWorkspaceMutation(t, c, codexID, state.AccessState.Generation, "workspace-get-after-directory-to-regular")
 	downloaded := requireDownload(t, c.request(t, request("workspace-download-regular", &remotev1.Request_DownloadWorkspaceEntry{DownloadWorkspaceEntry: &remotev1.DownloadWorkspaceEntryRequest{CodexId: codexID, RelativePath: "uploads/blob.bin"}})))
-	if downloaded.Kind != remotev1.WorkspaceDownloadKind_WORKSPACE_DOWNLOAD_KIND_REGULAR_FILE || downloaded.Filename != "blob.bin" || !bytes.Equal(downloaded.Content, regularContent) || downloaded.Entry.Revision != uploaded.Entry.Revision {
+	if downloaded.Kind != remotev1.WorkspaceDownloadKind_WORKSPACE_DOWNLOAD_KIND_REGULAR_FILE || downloaded.Filename != "blob.bin" || !bytes.Equal(downloaded.Content, finalRegularContent) || downloaded.Entry.Revision != replacedWithRegular.Entry.Revision {
 		t.Fatalf("regular DownloadWorkspaceEntry=%+v", downloaded)
 	}
 	expectWorkspaceError(t, c.request(t, request("workspace-read-binary", &remotev1.Request_ReadWorkspaceTextFile{ReadWorkspaceTextFile: &remotev1.ReadWorkspaceTextFileRequest{CodexId: codexID, RelativePath: "uploads/blob.bin"}})), remotev1.ErrorCode_ERROR_CODE_WORKSPACE_TEXT_NOT_UTF8)
 
-	archive := makeWorkspaceZIP(t, map[string][]byte{"top.txt": []byte("top"), "nested/inside.txt": []byte("inside")}, []string{"empty/"})
 	uploadedDirectory := requireUpload(t, c.request(t, request("workspace-upload-zip", &remotev1.Request_UploadWorkspaceEntry{UploadWorkspaceEntry: &remotev1.UploadWorkspaceEntryRequest{
 		CodexId: codexID, DestinationPath: "archive", Kind: remotev1.WorkspaceUploadKind_WORKSPACE_UPLOAD_KIND_ZIP_DIRECTORY,
-		Content: archive, Condition: remotev1.WorkspaceWriteCondition_WORKSPACE_WRITE_CONDITION_CREATE_ONLY,
-		ExpectedQuiescenceToken: state.AccessState.QuiescenceToken,
+		Content: archive, ExpectedQuiescenceToken: state.AccessState.QuiescenceToken,
 	}})))
-	if uploadedDirectory.Entry.Kind != remotev1.WorkspaceEntryKind_WORKSPACE_ENTRY_KIND_DIRECTORY || uploadedDirectory.Entry.Revision == "" {
+	if uploadedDirectory.Entry.Kind != remotev1.WorkspaceEntryKind_WORKSPACE_ENTRY_KIND_DIRECTORY || uploadedDirectory.Entry.Revision != "" {
 		t.Fatalf("ZIP directory upload=%+v", uploadedDirectory)
 	}
 	state.AccessState = syncWorkspaceMutation(t, c, codexID, state.AccessState.Generation, "workspace-get-after-zip")
+	replacementArchive := makeWorkspaceZIP(t, map[string][]byte{"replacement.txt": []byte("replacement")}, nil)
+	replacedDirectory := requireUpload(t, c.request(t, request("workspace-upload-replace-zip", &remotev1.Request_UploadWorkspaceEntry{UploadWorkspaceEntry: &remotev1.UploadWorkspaceEntryRequest{
+		CodexId: codexID, DestinationPath: "archive", Kind: remotev1.WorkspaceUploadKind_WORKSPACE_UPLOAD_KIND_ZIP_DIRECTORY,
+		Content: replacementArchive, ExpectedQuiescenceToken: state.AccessState.QuiescenceToken,
+	}})))
+	if replacedDirectory.Entry.Kind != remotev1.WorkspaceEntryKind_WORKSPACE_ENTRY_KIND_DIRECTORY || replacedDirectory.Entry.Revision != "" {
+		t.Fatalf("same-kind ZIP directory replacement=%+v", replacedDirectory)
+	}
+	state.AccessState = syncWorkspaceMutation(t, c, codexID, state.AccessState.Generation, "workspace-get-after-zip-replace")
 	downloadedDirectory := requireDownload(t, c.request(t, request("workspace-download-zip", &remotev1.Request_DownloadWorkspaceEntry{DownloadWorkspaceEntry: &remotev1.DownloadWorkspaceEntryRequest{CodexId: codexID, RelativePath: "archive"}})))
-	if downloadedDirectory.Kind != remotev1.WorkspaceDownloadKind_WORKSPACE_DOWNLOAD_KIND_ZIP_DIRECTORY || downloadedDirectory.Filename == "" {
+	if downloadedDirectory.Kind != remotev1.WorkspaceDownloadKind_WORKSPACE_DOWNLOAD_KIND_ZIP_DIRECTORY || downloadedDirectory.Filename == "" || downloadedDirectory.Entry.Revision != "" {
 		t.Fatalf("ZIP directory download=%+v", downloadedDirectory)
 	}
 	archiveFiles := readWorkspaceZIP(t, downloadedDirectory.Content)
-	if !bytes.Equal(archiveFiles["top.txt"], []byte("top")) || !bytes.Equal(archiveFiles["nested/inside.txt"], []byte("inside")) {
+	if len(archiveFiles) != 1 || !bytes.Equal(archiveFiles["replacement.txt"], []byte("replacement")) {
 		t.Fatalf("downloaded ZIP contents=%q", archiveFiles)
 	}
 
 	expectWorkspaceError(t, c.request(t, request("workspace-invalid-archive", &remotev1.Request_UploadWorkspaceEntry{UploadWorkspaceEntry: &remotev1.UploadWorkspaceEntryRequest{
 		CodexId: codexID, DestinationPath: "invalid-archive", Kind: remotev1.WorkspaceUploadKind_WORKSPACE_UPLOAD_KIND_ZIP_DIRECTORY,
-		Content: []byte("not a zip"), Condition: remotev1.WorkspaceWriteCondition_WORKSPACE_WRITE_CONDITION_CREATE_ONLY,
-		ExpectedQuiescenceToken: state.AccessState.QuiescenceToken,
+		Content: []byte("not a zip"), ExpectedQuiescenceToken: state.AccessState.QuiescenceToken,
 	}})), remotev1.ErrorCode_ERROR_CODE_WORKSPACE_ARCHIVE_INVALID)
 	traversingZIP := makeWorkspaceZIP(t, map[string][]byte{"../escape.txt": []byte("escape")}, nil)
 	expectWorkspaceError(t, c.request(t, request("workspace-traversing-archive", &remotev1.Request_UploadWorkspaceEntry{UploadWorkspaceEntry: &remotev1.UploadWorkspaceEntryRequest{
 		CodexId: codexID, DestinationPath: "traversing-archive", Kind: remotev1.WorkspaceUploadKind_WORKSPACE_UPLOAD_KIND_ZIP_DIRECTORY,
-		Content: traversingZIP, Condition: remotev1.WorkspaceWriteCondition_WORKSPACE_WRITE_CONDITION_CREATE_ONLY,
-		ExpectedQuiescenceToken: state.AccessState.QuiescenceToken,
+		Content: traversingZIP, ExpectedQuiescenceToken: state.AccessState.QuiescenceToken,
 	}})), remotev1.ErrorCode_ERROR_CODE_WORKSPACE_ARCHIVE_INVALID, remotev1.ErrorCode_ERROR_CODE_WORKSPACE_PATH_INVALID, remotev1.ErrorCode_ERROR_CODE_WORKSPACE_PATH_OUTSIDE_ROOT)
 	expectWorkspaceError(t, c.request(t, request("workspace-invalid-path", &remotev1.Request_ReadWorkspaceTextFile{ReadWorkspaceTextFile: &remotev1.ReadWorkspaceTextFileRequest{CodexId: codexID, RelativePath: "../outside"}})), remotev1.ErrorCode_ERROR_CODE_WORKSPACE_PATH_INVALID, remotev1.ErrorCode_ERROR_CODE_WORKSPACE_PATH_OUTSIDE_ROOT)
 	expectWorkspaceError(t, c.request(t, request("workspace-root-zip-target", &remotev1.Request_UploadWorkspaceEntry{UploadWorkspaceEntry: &remotev1.UploadWorkspaceEntryRequest{
 		CodexId: codexID, DestinationPath: "", Kind: remotev1.WorkspaceUploadKind_WORKSPACE_UPLOAD_KIND_ZIP_DIRECTORY, Content: archive,
-		Condition: remotev1.WorkspaceWriteCondition_WORKSPACE_WRITE_CONDITION_CREATE_ONLY, ExpectedQuiescenceToken: state.AccessState.QuiescenceToken,
+		ExpectedQuiescenceToken: state.AccessState.QuiescenceToken,
 	}})), remotev1.ErrorCode_ERROR_CODE_WORKSPACE_PATH_INVALID)
 	expectWorkspaceError(t, c.request(t, request("workspace-missing-parent", &remotev1.Request_UploadWorkspaceEntry{UploadWorkspaceEntry: &remotev1.UploadWorkspaceEntryRequest{
 		CodexId: codexID, DestinationPath: "missing/child.bin", Kind: remotev1.WorkspaceUploadKind_WORKSPACE_UPLOAD_KIND_REGULAR_FILE, Content: []byte("x"),
-		Condition: remotev1.WorkspaceWriteCondition_WORKSPACE_WRITE_CONDITION_CREATE_ONLY, ExpectedQuiescenceToken: state.AccessState.QuiescenceToken,
+		ExpectedQuiescenceToken: state.AccessState.QuiescenceToken,
 	}})), remotev1.ErrorCode_ERROR_CODE_WORKSPACE_ENTRY_NOT_FOUND)
+	if err := os.Symlink("blob.bin", filepath.Join(root, "uploads", "upload-link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(filepath.Join(root, "uploads", "upload-fifo"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for requestID, destination := range map[string]string{"workspace-upload-reject-symlink": "uploads/upload-link", "workspace-upload-reject-special": "uploads/upload-fifo"} {
+		expectWorkspaceError(t, c.request(t, request(requestID, &remotev1.Request_UploadWorkspaceEntry{UploadWorkspaceEntry: &remotev1.UploadWorkspaceEntryRequest{
+			CodexId: codexID, DestinationPath: destination, Kind: remotev1.WorkspaceUploadKind_WORKSPACE_UPLOAD_KIND_REGULAR_FILE,
+			Content: []byte("refused"), ExpectedQuiescenceToken: state.AccessState.QuiescenceToken,
+		}})), remotev1.ErrorCode_ERROR_CODE_WORKSPACE_ENTRY_TYPE_UNSUPPORTED)
+	}
 
 	if caps.MaxTextFileBytes > 32<<20 || caps.MaxInlineUploadBytes > 32<<20 || caps.MaxInlineDownloadBytes > 32<<20 || caps.MaxArchiveExpandedBytes > 32<<20 {
 		t.Fatalf("black-box hard-limit fixture refuses unexpectedly large advertised caps: %+v", caps)
 	}
 	expectWorkspaceError(t, c.request(t, request("workspace-upload-too-large", &remotev1.Request_UploadWorkspaceEntry{UploadWorkspaceEntry: &remotev1.UploadWorkspaceEntryRequest{
 		CodexId: codexID, DestinationPath: "uploads/too-large.bin", Kind: remotev1.WorkspaceUploadKind_WORKSPACE_UPLOAD_KIND_REGULAR_FILE,
-		Content: make([]byte, int(caps.MaxInlineUploadBytes)+1), Condition: remotev1.WorkspaceWriteCondition_WORKSPACE_WRITE_CONDITION_CREATE_ONLY,
-		ExpectedQuiescenceToken: state.AccessState.QuiescenceToken,
+		Content: make([]byte, int(caps.MaxInlineUploadBytes)+1), ExpectedQuiescenceToken: state.AccessState.QuiescenceToken,
 	}})), remotev1.ErrorCode_ERROR_CODE_WORKSPACE_UPLOAD_TOO_LARGE)
 	if err := os.WriteFile(filepath.Join(root, "too-large.txt"), make([]byte, int(caps.MaxTextFileBytes)+1), 0o600); err != nil {
 		t.Fatal(err)
@@ -218,8 +402,7 @@ func TestWorkspaceFormalWireScenario(t *testing.T) {
 	expandedZIP := makeWorkspaceZIP(t, map[string][]byte{"expanded.bin": make([]byte, int(caps.MaxArchiveExpandedBytes)+1)}, nil)
 	expectWorkspaceError(t, c.request(t, request("workspace-expanded-too-large", &remotev1.Request_UploadWorkspaceEntry{UploadWorkspaceEntry: &remotev1.UploadWorkspaceEntryRequest{
 		CodexId: codexID, DestinationPath: "expanded-too-large", Kind: remotev1.WorkspaceUploadKind_WORKSPACE_UPLOAD_KIND_ZIP_DIRECTORY,
-		Content: expandedZIP, Condition: remotev1.WorkspaceWriteCondition_WORKSPACE_WRITE_CONDITION_CREATE_ONLY,
-		ExpectedQuiescenceToken: state.AccessState.QuiescenceToken,
+		Content: expandedZIP, ExpectedQuiescenceToken: state.AccessState.QuiescenceToken,
 	}})), remotev1.ErrorCode_ERROR_CODE_WORKSPACE_ARCHIVE_EXPANDED_TOO_LARGE)
 	if err := os.WriteFile(filepath.Join(root, "oversized-dir", "expanded.bin"), make([]byte, int(caps.MaxArchiveExpandedBytes)+1), 0o600); err != nil {
 		t.Fatal(err)

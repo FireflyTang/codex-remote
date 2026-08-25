@@ -24,6 +24,13 @@ type CodexRecord struct {
 	CodexID, ThreadID, SessionSource, CWD, Title, Origin, Status, ActiveTurnID, RuntimeVersion, ManagementState string
 	CreatedAtUnixMS, ImportedAtUnixMS, LastActivityAtUnixMS, ManagedUntilUnixMS, WarningDeadlineUnixMS          int64
 	CurrentViewJSON                                                                                             []byte
+	ManualTitleOverride                                                                                         bool
+}
+
+type ForgottenSessionRecord struct {
+	Source, SessionID, CWD, Title, Preview, Origin string
+	CreatedAtUnixMS, UpdatedAtUnixMS               int64
+	Materialized                                   bool
 }
 
 type DedupState int
@@ -73,7 +80,7 @@ CREATE TABLE IF NOT EXISTS codexes (
  created_at_ms INTEGER NOT NULL, imported_at_ms INTEGER NOT NULL DEFAULT 0,
  last_activity_at_ms INTEGER NOT NULL, current_view_json BLOB,
  management_state TEXT NOT NULL DEFAULT '', managed_until_ms INTEGER NOT NULL DEFAULT 0,
- management_warning_deadline_ms INTEGER NOT NULL DEFAULT 0,
+ management_warning_deadline_ms INTEGER NOT NULL DEFAULT 0, manual_title_override INTEGER NOT NULL DEFAULT 0,
  UNIQUE(session_source, thread_id)
 );
 CREATE INDEX IF NOT EXISTS codexes_activity ON codexes(last_activity_at_ms DESC, codex_id);
@@ -89,6 +96,13 @@ CREATE TABLE IF NOT EXISTS resolved_pending (
  codex_id TEXT NOT NULL, pending_id TEXT NOT NULL, kind TEXT NOT NULL,
  resolved_json BLOB NOT NULL, resolved_at_ms INTEGER NOT NULL,
  PRIMARY KEY(codex_id,pending_id)
+);
+CREATE TABLE IF NOT EXISTS forgotten_sessions (
+ source TEXT NOT NULL, session_id TEXT NOT NULL, cwd TEXT NOT NULL,
+ title TEXT NOT NULL DEFAULT '', preview TEXT NOT NULL DEFAULT '', origin TEXT NOT NULL DEFAULT '',
+ created_at_ms INTEGER NOT NULL DEFAULT 0, updated_at_ms INTEGER NOT NULL DEFAULT 0,
+ materialized INTEGER NOT NULL DEFAULT 0,
+ PRIMARY KEY(source,session_id)
 );`)
 	if err != nil {
 		return err
@@ -150,7 +164,7 @@ func (s *Store) ensureSessionSourceIdentity(ctx context.Context) error {
  created_at_ms INTEGER NOT NULL, imported_at_ms INTEGER NOT NULL DEFAULT 0,
  last_activity_at_ms INTEGER NOT NULL, current_view_json BLOB,
  management_state TEXT NOT NULL DEFAULT '', managed_until_ms INTEGER NOT NULL DEFAULT 0,
- management_warning_deadline_ms INTEGER NOT NULL DEFAULT 0,
+ management_warning_deadline_ms INTEGER NOT NULL DEFAULT 0, manual_title_override INTEGER NOT NULL DEFAULT 0,
  UNIQUE(session_source,thread_id)
 )`); err != nil {
 		return err
@@ -191,6 +205,7 @@ func (s *Store) ensureLifecycleColumns(ctx context.Context) error {
 		{"management_state", `ALTER TABLE codexes ADD COLUMN management_state TEXT NOT NULL DEFAULT ''`},
 		{"managed_until_ms", `ALTER TABLE codexes ADD COLUMN managed_until_ms INTEGER NOT NULL DEFAULT 0`},
 		{"management_warning_deadline_ms", `ALTER TABLE codexes ADD COLUMN management_warning_deadline_ms INTEGER NOT NULL DEFAULT 0`},
+		{"manual_title_override", `ALTER TABLE codexes ADD COLUMN manual_title_override INTEGER NOT NULL DEFAULT 0`},
 	} {
 		if !columns[migration.name] {
 			if _, err := s.db.ExecContext(ctx, migration.sql); err != nil {
@@ -253,13 +268,13 @@ func (s *Store) CompleteRequest(ctx context.Context, requestID string, responseJ
 }
 
 func (s *Store) UpsertCodex(ctx context.Context, r CodexRecord) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO codexes(codex_id,thread_id,session_source,cwd,title,origin,status,active_turn_id,runtime_version,created_at_ms,imported_at_ms,last_activity_at_ms,current_view_json,management_state,managed_until_ms,management_warning_deadline_ms)
-	 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(codex_id) DO UPDATE SET thread_id=excluded.thread_id,session_source=excluded.session_source,cwd=excluded.cwd,title=excluded.title,origin=excluded.origin,status=excluded.status,active_turn_id=excluded.active_turn_id,runtime_version=excluded.runtime_version,imported_at_ms=excluded.imported_at_ms,last_activity_at_ms=excluded.last_activity_at_ms,current_view_json=excluded.current_view_json,management_state=excluded.management_state,managed_until_ms=excluded.managed_until_ms,management_warning_deadline_ms=excluded.management_warning_deadline_ms`,
-		r.CodexID, r.ThreadID, normalizeSessionSource(r.SessionSource), r.CWD, r.Title, r.Origin, r.Status, r.ActiveTurnID, r.RuntimeVersion, r.CreatedAtUnixMS, r.ImportedAtUnixMS, r.LastActivityAtUnixMS, nullableBytes(r.CurrentViewJSON), r.ManagementState, r.ManagedUntilUnixMS, r.WarningDeadlineUnixMS)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO codexes(codex_id,thread_id,session_source,cwd,title,origin,status,active_turn_id,runtime_version,created_at_ms,imported_at_ms,last_activity_at_ms,current_view_json,management_state,managed_until_ms,management_warning_deadline_ms,manual_title_override)
+	 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(codex_id) DO UPDATE SET thread_id=excluded.thread_id,session_source=excluded.session_source,cwd=excluded.cwd,title=excluded.title,origin=excluded.origin,status=excluded.status,active_turn_id=excluded.active_turn_id,runtime_version=excluded.runtime_version,imported_at_ms=excluded.imported_at_ms,last_activity_at_ms=excluded.last_activity_at_ms,current_view_json=excluded.current_view_json,management_state=excluded.management_state,managed_until_ms=excluded.managed_until_ms,management_warning_deadline_ms=excluded.management_warning_deadline_ms,manual_title_override=excluded.manual_title_override`,
+		r.CodexID, r.ThreadID, normalizeSessionSource(r.SessionSource), r.CWD, r.Title, r.Origin, r.Status, r.ActiveTurnID, r.RuntimeVersion, r.CreatedAtUnixMS, r.ImportedAtUnixMS, r.LastActivityAtUnixMS, nullableBytes(r.CurrentViewJSON), r.ManagementState, r.ManagedUntilUnixMS, r.WarningDeadlineUnixMS, r.ManualTitleOverride)
 	return err
 }
 
-const codexSelectColumns = `codex_id,thread_id,session_source,cwd,title,origin,status,active_turn_id,runtime_version,created_at_ms,imported_at_ms,last_activity_at_ms,current_view_json,management_state,managed_until_ms,management_warning_deadline_ms`
+const codexSelectColumns = `codex_id,thread_id,session_source,cwd,title,origin,status,active_turn_id,runtime_version,created_at_ms,imported_at_ms,last_activity_at_ms,current_view_json,management_state,managed_until_ms,management_warning_deadline_ms,manual_title_override`
 
 func (s *Store) GetCodex(ctx context.Context, id string) (CodexRecord, error) {
 	return s.getCodex(ctx, `SELECT `+codexSelectColumns+` FROM codexes WHERE codex_id=?`, id)
@@ -309,7 +324,72 @@ func (s *Store) getCodex2(ctx context.Context, query, arg1, arg2 string) (CodexR
 }
 
 func scanCodex(scan func(...any) error, r *CodexRecord) error {
-	return scan(&r.CodexID, &r.ThreadID, &r.SessionSource, &r.CWD, &r.Title, &r.Origin, &r.Status, &r.ActiveTurnID, &r.RuntimeVersion, &r.CreatedAtUnixMS, &r.ImportedAtUnixMS, &r.LastActivityAtUnixMS, &r.CurrentViewJSON, &r.ManagementState, &r.ManagedUntilUnixMS, &r.WarningDeadlineUnixMS)
+	return scan(&r.CodexID, &r.ThreadID, &r.SessionSource, &r.CWD, &r.Title, &r.Origin, &r.Status, &r.ActiveTurnID, &r.RuntimeVersion, &r.CreatedAtUnixMS, &r.ImportedAtUnixMS, &r.LastActivityAtUnixMS, &r.CurrentViewJSON, &r.ManagementState, &r.ManagedUntilUnixMS, &r.WarningDeadlineUnixMS, &r.ManualTitleOverride)
+}
+
+// DeleteCodex removes Host-owned state while retaining global request dedup.
+func (s *Store) DeleteCodex(ctx context.Context, codexID string) error {
+	if codexID == "" {
+		return errors.New("codex id is required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var exists int
+	if err = tx.QueryRowContext(ctx, `SELECT 1 FROM codexes WHERE codex_id=?`, codexID).Scan(&exists); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM resolved_pending WHERE codex_id=?`, codexID); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM event_heads WHERE codex_id=?`, codexID); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM codexes WHERE codex_id=?`, codexID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) UpsertForgottenSession(ctx context.Context, r ForgottenSessionRecord) error {
+	if strings.TrimSpace(r.SessionID) == "" || strings.TrimSpace(r.CWD) == "" {
+		return errors.New("forgotten session id and cwd are required")
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO forgotten_sessions(source,session_id,cwd,title,preview,origin,created_at_ms,updated_at_ms,materialized)
+	 VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(source,session_id) DO UPDATE SET cwd=excluded.cwd,title=excluded.title,preview=excluded.preview,origin=excluded.origin,created_at_ms=excluded.created_at_ms,updated_at_ms=excluded.updated_at_ms,materialized=excluded.materialized`,
+		normalizeSessionSource(r.Source), r.SessionID, r.CWD, r.Title, r.Preview, r.Origin, r.CreatedAtUnixMS, r.UpdatedAtUnixMS, r.Materialized)
+	return err
+}
+
+func (s *Store) GetForgottenSession(ctx context.Context, source, sessionID string) (ForgottenSessionRecord, error) {
+	var r ForgottenSessionRecord
+	err := s.db.QueryRowContext(ctx, `SELECT source,session_id,cwd,title,preview,origin,created_at_ms,updated_at_ms,materialized FROM forgotten_sessions WHERE source=? AND session_id=?`, normalizeSessionSource(source), sessionID).
+		Scan(&r.Source, &r.SessionID, &r.CWD, &r.Title, &r.Preview, &r.Origin, &r.CreatedAtUnixMS, &r.UpdatedAtUnixMS, &r.Materialized)
+	return r, err
+}
+
+func (s *Store) ListForgottenSessions(ctx context.Context, cwd string) ([]ForgottenSessionRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT source,session_id,cwd,title,preview,origin,created_at_ms,updated_at_ms,materialized FROM forgotten_sessions WHERE cwd=? ORDER BY updated_at_ms DESC,source,session_id`, cwd)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ForgottenSessionRecord
+	for rows.Next() {
+		var r ForgottenSessionRecord
+		if err := rows.Scan(&r.Source, &r.SessionID, &r.CWD, &r.Title, &r.Preview, &r.Origin, &r.CreatedAtUnixMS, &r.UpdatedAtUnixMS, &r.Materialized); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) DeleteForgottenSession(ctx context.Context, source, sessionID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM forgotten_sessions WHERE source=? AND session_id=?`, normalizeSessionSource(source), sessionID)
+	return err
 }
 
 func (s *Store) SetCurrentView(ctx context.Context, codexID string, viewJSON []byte) error {

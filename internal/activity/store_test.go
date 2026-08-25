@@ -491,3 +491,30 @@ func TestWatchReloadsDurableBoundaryAfterIndeterminatePublishFailure(t *testing.
 		t.Fatalf("Watch response=%+v", w.Response)
 	}
 }
+
+func TestForgetDeliversTerminalEventClosesWatchAndRemovesStream(t *testing.T) {
+	ctx := context.Background()
+	p := newPersistence(t)
+	s := NewStore(p, nil, 4)
+	w, err := s.Watch(ctx, "c", nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event, err := s.Forget(ctx, "c", "forget-request", p.DeleteCodex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event.EventSeq != 1 || event.CausedByRequestId != "forget-request" || event.GetCodexForgotten() == nil {
+		t.Fatalf("terminal event=%+v", event)
+	}
+	got, ok := <-w.Events
+	if !ok || got.GetCodexForgotten() == nil || got.EventSeq != 1 {
+		t.Fatalf("watch terminal event=%+v open=%v", got, ok)
+	}
+	if _, ok = <-w.Events; ok {
+		t.Fatal("watch remained open after terminal event")
+	}
+	if _, err = s.Watch(ctx, "c", nil, 1); !errors.Is(err, ErrCodexNotFound) {
+		t.Fatalf("Watch after forget err=%v", err)
+	}
+}

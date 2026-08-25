@@ -3,7 +3,7 @@ module github.com/kylin1993/codex-remote
 go 1.26.5
 
 require (
-	github.com/FireflyTang/codex-remote-protocol v1.1.0
+	github.com/FireflyTang/codex-remote-protocol v1.1.2
 	github.com/coder/websocket v1.8.15
 	google.golang.org/protobuf v1.36.11
 	modernc.org/sqlite v1.38.2

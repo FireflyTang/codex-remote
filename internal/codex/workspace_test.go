@@ -97,6 +97,103 @@ func TestWorkspaceMutationStatePersistsAndPublishes(t *testing.T) {
 	}
 }
 
+func TestWorkspaceStateSinkIgnoresGenerationOlderThanRestoredView(t *testing.T) {
+	m, _ := workspaceManager(t)
+	m.mu.Lock()
+	view := proto.Clone(m.byID["c"]).(*remotev1.CurrentView)
+	view.WorkspaceAccessState.Generation = 10
+	m.byID["c"] = view
+	m.mu.Unlock()
+
+	stale := proto.Clone(view.WorkspaceAccessState).(*remotev1.WorkspaceAccessState)
+	stale.Generation = 9
+	stale.ActiveAgentCount = 1
+	stale.MutationStatus = remotev1.WorkspaceMutationStatus_WORKSPACE_MUTATION_STATUS_BUSY
+	stale.QuiescenceToken = ""
+	if err := m.commitWorkspaceState(context.Background(), "c", stale); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.RLock()
+	got := proto.Clone(m.byID["c"].WorkspaceAccessState).(*remotev1.WorkspaceAccessState)
+	m.mu.RUnlock()
+	if got.Generation != 10 || got.ActiveAgentCount != 0 {
+		t.Fatalf("stale sink replaced restored state: %+v", got)
+	}
+}
+
+func TestWorkspaceTransitionAdoptedDurablyByRestoreDoesNotRollBack(t *testing.T) {
+	m, _ := workspaceManager(t)
+	transition := make(chan *remotev1.WorkspaceAccessState, 1)
+	releaseSink := make(chan struct{})
+	m.Workspaces.SetStateSink(func(ctx context.Context, codexID string, state *remotev1.WorkspaceAccessState) error {
+		transition <- proto.Clone(state).(*remotev1.WorkspaceAccessState)
+		<-releaseSink
+		return m.commitWorkspaceState(ctx, codexID, state)
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	agentDone := make(chan error, 1)
+	go func() { agentDone <- m.Workspaces.AgentStarted(ctx, "c", "turn-during-restore") }()
+	adopted := <-transition
+
+	// Model Restore adopting and durably persisting the exact pending live
+	// transition before the original sink resumes with a canceled context.
+	m.commitMu.Lock()
+	m.mu.Lock()
+	view := proto.Clone(m.byID["c"]).(*remotev1.CurrentView)
+	view.WorkspaceAccessState = proto.Clone(adopted).(*remotev1.WorkspaceAccessState)
+	m.byID["c"] = view
+	m.mu.Unlock()
+	if err := m.persistState(context.Background(), view); err != nil {
+		m.commitMu.Unlock()
+		t.Fatal(err)
+	}
+	m.commitMu.Unlock()
+	cancel()
+	close(releaseSink)
+	if err := <-agentDone; err != nil {
+		t.Fatalf("durably adopted transition rolled back: %v", err)
+	}
+
+	serviceState, _, err := m.Workspaces.State("c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.mu.RLock()
+	memoryState := proto.Clone(m.byID["c"].WorkspaceAccessState).(*remotev1.WorkspaceAccessState)
+	m.mu.RUnlock()
+	raw, err := m.Persistence.CurrentView(context.Background(), "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	durable := new(remotev1.CurrentView)
+	if err := protojson.Unmarshal(raw, durable); err != nil {
+		t.Fatal(err)
+	}
+	if !proto.Equal(serviceState, adopted) || !proto.Equal(memoryState, adopted) || !proto.Equal(durable.WorkspaceAccessState, adopted) {
+		t.Fatalf("state split after adoption: service=%+v memory=%+v durable=%+v adopted=%+v", serviceState, memoryState, durable.WorkspaceAccessState, adopted)
+	}
+}
+
+func TestWorkspaceTransitionMatchingOnlyMemoryStillPublishes(t *testing.T) {
+	m, _ := workspaceManager(t)
+	m.mu.Lock()
+	view := proto.Clone(m.byID["c"]).(*remotev1.CurrentView)
+	view.WorkspaceAccessState.Generation++
+	m.byID["c"] = view
+	m.mu.Unlock()
+	called := false
+	m.testPublishEvent = func(context.Context, *remotev1.Event, *remotev1.CurrentView, *remotev1.Provenance, string) (*remotev1.Event, error) {
+		called = true
+		return nil, context.Canceled
+	}
+	if err := m.commitWorkspaceState(context.Background(), "c", view.WorkspaceAccessState); !errors.Is(err, context.Canceled) {
+		t.Fatalf("commit error=%v", err)
+	}
+	if !called {
+		t.Fatal("matching in-memory state bypassed publish without durable adoption")
+	}
+}
+
 func TestWorkspaceMutationDeterministicPublishFailureRollsBackAndRetries(t *testing.T) {
 	m, root := workspaceManager(t)
 	ctx := context.Background()

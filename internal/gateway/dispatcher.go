@@ -28,6 +28,8 @@ type Backend interface {
 	RespondApproval(context.Context, *remotev1.RespondApprovalRequest) (*remotev1.RespondApprovalResponse, error)
 	RespondUserInput(context.Context, *remotev1.RespondUserInputRequest) (*remotev1.RespondUserInputResponse, error)
 	UnmanageCodex(context.Context, *remotev1.UnmanageCodexRequest) (*remotev1.UnmanageCodexResponse, error)
+	RenameCodex(context.Context, *remotev1.RenameCodexRequest) (*remotev1.RenameCodexResponse, error)
+	ForgetCodex(context.Context, *remotev1.ForgetCodexRequest) (*remotev1.ForgetCodexResponse, error)
 	GetWorkspace(context.Context, *remotev1.GetWorkspaceRequest) (*remotev1.GetWorkspaceResponse, error)
 	ListWorkspaceEntries(context.Context, *remotev1.ListWorkspaceEntriesRequest) (*remotev1.ListWorkspaceEntriesResponse, error)
 	ReadWorkspaceTextFile(context.Context, *remotev1.ReadWorkspaceTextFileRequest) (*remotev1.ReadWorkspaceTextFileResponse, error)
@@ -188,6 +190,14 @@ func (d *Dispatcher) call(ctx context.Context, req *remotev1.Request) (*remotev1
 		var v *remotev1.UnmanageCodexResponse
 		v, err = d.Backend.UnmanageCodex(ctx, x.UnmanageCodex)
 		resp.Result = &remotev1.Response_UnmanageCodex{UnmanageCodex: v}
+	case *remotev1.Request_RenameCodex:
+		var v *remotev1.RenameCodexResponse
+		v, err = d.Backend.RenameCodex(ctx, x.RenameCodex)
+		resp.Result = &remotev1.Response_RenameCodex{RenameCodex: v}
+	case *remotev1.Request_ForgetCodex:
+		var v *remotev1.ForgetCodexResponse
+		v, err = d.Backend.ForgetCodex(ctx, x.ForgetCodex)
+		resp.Result = &remotev1.Response_ForgetCodex{ForgetCodex: v}
 	case *remotev1.Request_GetWorkspace:
 		var v *remotev1.GetWorkspaceResponse
 		v, err = d.Backend.GetWorkspace(ctx, x.GetWorkspace)
@@ -261,6 +271,10 @@ func operation(req *remotev1.Request) (string, bool) {
 		return "respond_user_input", true
 	case *remotev1.Request_UnmanageCodex:
 		return "unmanage_codex", true
+	case *remotev1.Request_RenameCodex:
+		return "rename_codex", true
+	case *remotev1.Request_ForgetCodex:
+		return "forget_codex", true
 	case *remotev1.Request_GetWorkspace:
 		return "get_workspace", false
 	case *remotev1.Request_ListWorkspaceEntries:
@@ -302,6 +316,10 @@ func markDeduplicated(r *remotev1.Response) {
 		x.RespondUserInput.Deduplicated = true
 	case *remotev1.Response_UnmanageCodex:
 		x.UnmanageCodex.Deduplicated = true
+	case *remotev1.Response_RenameCodex:
+		x.RenameCodex.Deduplicated = true
+	case *remotev1.Response_ForgetCodex:
+		x.ForgetCodex.Deduplicated = true
 	case *remotev1.Response_WriteWorkspaceTextFile:
 		x.WriteWorkspaceTextFile.Deduplicated = true
 	case *remotev1.Response_UploadWorkspaceEntry:

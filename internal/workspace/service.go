@@ -42,17 +42,24 @@ func (e *Error) Unwrap() error { return e.Err }
 type StateSink func(context.Context, string, *remotev1.WorkspaceAccessState) error
 
 type workspaceState struct {
+	// mu protects this Codex's root and access state. Filesystem reads and state
+	// sink calls must happen after releasing it.
+	mu          sync.Mutex
+	coordinator sync.RWMutex
 	root        string
 	displayRoot string
 	state       *remotev1.WorkspaceAccessState
 	agentIDs    map[string]struct{}
+	pending     chan struct{}
+	removed     bool
 }
 
 type Service struct {
-	mu     sync.Mutex
-	config Config
-	states map[string]*workspaceState
-	sink   StateSink
+	mu                  sync.RWMutex
+	config              Config
+	states              map[string]*workspaceState
+	sink                StateSink
+	beforeListEntryTest func(string)
 }
 
 func New(config Config) (*Service, error) {
@@ -88,8 +95,6 @@ func (s *Service) now() time.Time {
 }
 
 func (s *Service) Register(codexID, root string, persisted *remotev1.WorkspaceAccessState) (*remotev1.WorkspaceAccessState, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	resolved, err := registerRoot(root)
 	if err != nil {
 		return nil, err
@@ -104,43 +109,175 @@ func (s *Service) Register(codexID, root string, persisted *remotev1.WorkspaceAc
 		state.QuiescenceToken = newToken()
 		state.ObservedAtUnixMs = s.now().UnixMilli()
 	}
-	s.states[codexID] = &workspaceState{root: resolved, displayRoot: root, state: state, agentIDs: make(map[string]struct{})}
-	return cloneState(state), nil
+	s.mu.Lock()
+	ws := s.states[codexID]
+	if ws == nil {
+		ws = &workspaceState{root: resolved, displayRoot: root, state: state, agentIDs: make(map[string]struct{})}
+		s.states[codexID] = ws
+		s.mu.Unlock()
+		return cloneState(state), nil
+	}
+	s.mu.Unlock()
+
+	// A runtime Ready restore can overlap a live workspace transition. Preserve
+	// a newer in-memory generation instead of replacing it with an older
+	// persisted snapshot. No state sink is called while ws.mu is held.
+	ws.coordinator.Lock()
+	defer ws.coordinator.Unlock()
+	ws.mu.Lock()
+	ws.root = resolved
+	ws.displayRoot = root
+	ws.removed = false
+	if ws.state == nil || ws.state.Generation < state.Generation {
+		ws.state = state
+		ws.agentIDs = make(map[string]struct{})
+	}
+	result := cloneState(ws.state)
+	ws.mu.Unlock()
+	return result, nil
+}
+
+// Unregister removes the Host-owned workspace mapping for a forgotten Codex.
+// The coordinator drains admitted operations before the mapping disappears.
+func (s *Service) Unregister(codexID string) {
+	s.mu.RLock()
+	ws := s.states[codexID]
+	s.mu.RUnlock()
+	if ws == nil {
+		return
+	}
+	ws.coordinator.Lock()
+	s.mu.Lock()
+	if s.states[codexID] == ws {
+		delete(s.states, codexID)
+	}
+	s.mu.Unlock()
+	ws.mu.Lock()
+	ws.removed = true
+	ws.mu.Unlock()
+	ws.coordinator.Unlock()
 }
 
 func (s *Service) State(codexID string) (*remotev1.WorkspaceAccessState, string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	ws, err := s.known(codexID)
 	if err != nil {
 		return nil, "", err
 	}
-	if _, err := availableRoot(ws); err != nil {
+	ws.coordinator.RLock()
+	defer ws.coordinator.RUnlock()
+	if _, err := rootForAccess(ws); err != nil {
 		return nil, "", err
 	}
-	return cloneState(ws.state), ws.displayRoot, nil
+	ws.mu.Lock()
+	state, displayRoot := cloneState(ws.state), ws.displayRoot
+	ws.mu.Unlock()
+	return state, displayRoot, nil
+}
+
+func rootForAccess(ws *workspaceState) (string, error) {
+	ws.mu.Lock()
+	if ws.removed {
+		ws.mu.Unlock()
+		return "", workspaceErr(remotev1.ErrorCode_ERROR_CODE_CODEX_NOT_FOUND, "codex not found")
+	}
+	root := ws.root
+	ws.mu.Unlock()
+	resolved, err := canonicalRoot(root)
+	if err != nil {
+		return "", err
+	}
+	ws.mu.Lock()
+	if ws.root == root {
+		ws.root = resolved
+	}
+	ws.mu.Unlock()
+	return resolved, nil
+}
+
+func lockMutationCoordinator(ctx context.Context, ws *workspaceState) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		ws.coordinator.Lock()
+		ws.mu.Lock()
+		if ws.removed {
+			ws.mu.Unlock()
+			ws.coordinator.Unlock()
+			return workspaceErr(remotev1.ErrorCode_ERROR_CODE_CODEX_NOT_FOUND, "codex not found")
+		}
+		pending := ws.pending
+		ws.mu.Unlock()
+		if pending == nil {
+			return nil
+		}
+		ws.coordinator.Unlock()
+		select {
+		case <-pending:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func beginPendingLocked(ws *workspaceState) chan struct{} {
+	pending := make(chan struct{})
+	ws.pending = pending
+	return pending
+}
+
+func finishPending(ws *workspaceState, pending chan struct{}) {
+	ws.mu.Lock()
+	if ws.pending == pending {
+		ws.pending = nil
+		close(pending)
+	}
+	ws.mu.Unlock()
 }
 
 func (s *Service) AgentStarted(ctx context.Context, codexID, agentID string) error {
 	if agentID == "" {
 		return workspaceErr(remotev1.ErrorCode_ERROR_CODE_INVALID_REQUEST, "agent id is required")
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	ws, err := s.known(codexID)
 	if err != nil {
 		return err
 	}
+	if err := lockMutationCoordinator(ctx, ws); err != nil {
+		return err
+	}
+	ws.mu.Lock()
 	if _, exists := ws.agentIDs[agentID]; exists {
+		ws.mu.Unlock()
+		ws.coordinator.Unlock()
 		return nil
 	}
+	previous := cloneState(ws.state)
 	ws.agentIDs[agentID] = struct{}{}
 	ws.state.Generation++
 	ws.state.ActiveAgentCount = uint32(len(ws.agentIDs))
 	ws.state.MutationStatus = remotev1.WorkspaceMutationStatus_WORKSPACE_MUTATION_STATUS_BUSY
 	ws.state.QuiescenceToken = ""
 	ws.state.ObservedAtUnixMs = s.now().UnixMilli()
-	return s.emitLocked(ctx, codexID, ws)
+	state := cloneState(ws.state)
+	pending := beginPendingLocked(ws)
+	sink := s.stateSink()
+	ws.mu.Unlock()
+	ws.coordinator.Unlock()
+	if err := emit(ctx, sink, codexID, state); err != nil {
+		if !errors.Is(err, persistence.ErrEventCommitOutcomeUnknown) {
+			ws.mu.Lock()
+			if proto.Equal(ws.state, state) {
+				delete(ws.agentIDs, agentID)
+				ws.state = previous
+			}
+			ws.mu.Unlock()
+		}
+		finishPending(ws, pending)
+		return err
+	}
+	finishPending(ws, pending)
+	return nil
 }
 
 // RestoreAgent reconstructs a known active agent without publishing during the
@@ -150,11 +287,18 @@ func (s *Service) RestoreAgent(codexID, agentID string) (*remotev1.WorkspaceAcce
 	if agentID == "" {
 		agentID = "restore-unknown"
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	ws, err := s.known(codexID)
 	if err != nil {
 		return nil, err
+	}
+	// Restore runs under Manager.commitMu and deliberately bypasses a pending
+	// live sink, which may itself be waiting for that commit boundary.
+	ws.coordinator.Lock()
+	defer ws.coordinator.Unlock()
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	if ws.removed {
+		return nil, workspaceErr(remotev1.ErrorCode_ERROR_CODE_CODEX_NOT_FOUND, "codex not found")
 	}
 	if _, exists := ws.agentIDs[agentID]; exists {
 		return cloneState(ws.state), nil
@@ -169,15 +313,20 @@ func (s *Service) RestoreAgent(codexID, agentID string) (*remotev1.WorkspaceAcce
 }
 
 func (s *Service) AgentStopped(ctx context.Context, codexID, agentID string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	ws, err := s.known(codexID)
 	if err != nil {
 		return err
 	}
+	if err := lockMutationCoordinator(ctx, ws); err != nil {
+		return err
+	}
+	ws.mu.Lock()
 	if _, exists := ws.agentIDs[agentID]; !exists {
+		ws.mu.Unlock()
+		ws.coordinator.Unlock()
 		return nil
 	}
+	previous := cloneState(ws.state)
 	delete(ws.agentIDs, agentID)
 	ws.state.Generation++
 	ws.state.ActiveAgentCount = uint32(len(ws.agentIDs))
@@ -189,62 +338,99 @@ func (s *Service) AgentStopped(ctx context.Context, codexID, agentID string) err
 		ws.state.QuiescenceToken = ""
 	}
 	ws.state.ObservedAtUnixMs = s.now().UnixMilli()
-	return s.emitLocked(ctx, codexID, ws)
+	state := cloneState(ws.state)
+	pending := beginPendingLocked(ws)
+	sink := s.stateSink()
+	ws.mu.Unlock()
+	ws.coordinator.Unlock()
+	if err := emit(ctx, sink, codexID, state); err != nil {
+		if !errors.Is(err, persistence.ErrEventCommitOutcomeUnknown) {
+			ws.mu.Lock()
+			if proto.Equal(ws.state, state) {
+				ws.agentIDs[agentID] = struct{}{}
+				ws.state = previous
+			}
+			ws.mu.Unlock()
+		}
+		finishPending(ws, pending)
+		return err
+	}
+	finishPending(ws, pending)
+	return nil
 }
 
-func (s *Service) List(codexID, relative string) ([]*remotev1.WorkspaceEntry, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *Service) List(ctx context.Context, codexID, relative string, start, size int) ([]*remotev1.WorkspaceEntry, int, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
 	ws, err := s.known(codexID)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	root, err := availableRoot(ws)
+	ws.coordinator.RLock()
+	defer ws.coordinator.RUnlock()
+	root, err := rootForAccess(ws)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	abs, err := resolve(root, relative, true, true)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	info, err := os.Stat(abs)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, workspaceErr(remotev1.ErrorCode_ERROR_CODE_WORKSPACE_ENTRY_NOT_FOUND, "directory not found")
+		return nil, 0, workspaceErr(remotev1.ErrorCode_ERROR_CODE_WORKSPACE_ENTRY_NOT_FOUND, "directory not found")
 	}
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if !info.IsDir() {
-		return nil, workspaceErr(remotev1.ErrorCode_ERROR_CODE_WORKSPACE_ENTRY_TYPE_UNSUPPORTED, "entry is not a directory")
+		return nil, 0, workspaceErr(remotev1.ErrorCode_ERROR_CODE_WORKSPACE_ENTRY_TYPE_UNSUPPORTED, "entry is not a directory")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
 	}
 	dir, err := os.ReadDir(abs)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	out := make([]*remotev1.WorkspaceEntry, 0, len(dir))
-	for _, item := range dir {
+	total := len(dir)
+	if start < 0 || start > total || size < 0 {
+		return nil, total, workspaceErr(remotev1.ErrorCode_ERROR_CODE_INVALID_REQUEST, "page offset is out of range")
+	}
+	end := min(start+size, total)
+	out := make([]*remotev1.WorkspaceEntry, 0, end-start)
+	for _, item := range dir[start:end] {
+		if err := ctx.Err(); err != nil {
+			return nil, total, err
+		}
 		child := item.Name()
 		if relative != "" {
 			child = relative + "/" + child
 		}
-		entry, err := entryMetadata(root, child, s.config.MaxTextFileBytes)
+		if s.beforeListEntryTest != nil {
+			s.beforeListEntryTest(child)
+		}
+		entry, err := entryMetadata(root, child, s.config.MaxTextFileBytes, false)
 		if err != nil {
-			return nil, err
+			return nil, total, err
 		}
 		out = append(out, entry)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out, nil
+	return out, total, nil
 }
 
-func (s *Service) ReadText(codexID, relative string) (*remotev1.WorkspaceEntry, string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *Service) ReadText(ctx context.Context, codexID, relative string) (*remotev1.WorkspaceEntry, string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
 	ws, err := s.known(codexID)
 	if err != nil {
 		return nil, "", err
 	}
-	root, err := availableRoot(ws)
+	ws.coordinator.RLock()
+	defer ws.coordinator.RUnlock()
+	root, err := rootForAccess(ws)
 	if err != nil {
 		return nil, "", err
 	}
@@ -266,7 +452,7 @@ func (s *Service) ReadText(codexID, relative string) (*remotev1.WorkspaceEntry, 
 		if uint64(before.Size()) > s.config.MaxTextFileBytes {
 			return nil, "", workspaceErr(remotev1.ErrorCode_ERROR_CODE_WORKSPACE_TEXT_TOO_LARGE, "text file exceeds hard limit")
 		}
-		content, err := os.ReadFile(abs)
+		content, err := readFileContext(ctx, abs)
 		if err != nil {
 			return nil, "", err
 		}
@@ -291,106 +477,150 @@ func (s *Service) WriteText(ctx context.Context, codexID, relative, text, expect
 	if uint64(len(text)) > s.config.MaxTextFileBytes {
 		return nil, workspaceErr(remotev1.ErrorCode_ERROR_CODE_WORKSPACE_TEXT_TOO_LARGE, "text exceeds hard limit")
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	ws, err := s.known(codexID)
 	if err != nil {
 		return nil, err
 	}
-	root, err := availableRoot(ws)
+	if err := lockMutationCoordinator(ctx, ws); err != nil {
+		return nil, err
+	}
+	root, err := rootForAccess(ws)
 	if err != nil {
+		ws.coordinator.Unlock()
 		return nil, err
 	}
 	abs, err := resolve(root, relative, false, false)
 	if err != nil {
+		ws.coordinator.Unlock()
 		return nil, err
 	}
-	if err := s.validateMutation(ws, abs, condition, expectedRevision, token, remotev1.WorkspaceEntryKind_WORKSPACE_ENTRY_KIND_REGULAR_FILE); err != nil {
+	if err := validateMutationState(ws, token); err != nil {
+		ws.coordinator.Unlock()
+		return nil, err
+	}
+	if err := validateMutationTarget(abs, condition, expectedRevision, remotev1.WorkspaceEntryKind_WORKSPACE_ENTRY_KIND_REGULAR_FILE); err != nil {
+		ws.coordinator.Unlock()
 		return nil, err
 	}
 	backup, err := stageTarget(abs)
 	if err != nil {
+		ws.coordinator.Unlock()
 		return nil, err
 	}
 	if err := atomicFile(abs, []byte(text)); err != nil {
+		ws.coordinator.Unlock()
 		return nil, rollbackMutation(backup, err)
 	}
-	entry, err := entryMetadata(root, relative, s.config.MaxTextFileBytes)
+	entry, err := entryMetadata(root, relative, s.config.MaxTextFileBytes, true)
 	if err != nil {
+		ws.coordinator.Unlock()
 		return nil, rollbackMutation(backup, err)
 	}
-	if err := s.mutationCommittedLocked(ctx, codexID, ws); err != nil {
+	ws.mu.Lock()
+	previous, state := s.advanceMutationLocked(ws)
+	pending := beginPendingLocked(ws)
+	sink := s.stateSink()
+	ws.mu.Unlock()
+	ws.coordinator.Unlock()
+	if err := emit(ctx, sink, codexID, state); err != nil {
 		if errors.Is(err, persistence.ErrEventCommitOutcomeUnknown) {
 			backup.discard()
+			finishPending(ws, pending)
 			return nil, err
 		}
+		s.rollbackState(ws, state, previous)
+		finishPending(ws, pending)
 		return nil, rollbackMutation(backup, err)
 	}
+	finishPending(ws, pending)
 	backup.discard()
 	return entry, nil
 }
 
-func (s *Service) Upload(ctx context.Context, codexID, destination string, kind remotev1.WorkspaceUploadKind, content []byte, condition remotev1.WorkspaceWriteCondition, expectedRevision, token string) (*remotev1.WorkspaceEntry, error) {
+func (s *Service) Upload(ctx context.Context, codexID, destination string, kind remotev1.WorkspaceUploadKind, content []byte, token string) (*remotev1.WorkspaceEntry, error) {
 	if uint64(len(content)) > s.config.MaxInlineUploadBytes {
 		return nil, workspaceErr(remotev1.ErrorCode_ERROR_CODE_WORKSPACE_UPLOAD_TOO_LARGE, "upload exceeds hard limit")
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	ws, err := s.known(codexID)
 	if err != nil {
 		return nil, err
 	}
-	root, err := availableRoot(ws)
+	if err := lockMutationCoordinator(ctx, ws); err != nil {
+		return nil, err
+	}
+	root, err := rootForAccess(ws)
 	if err != nil {
+		ws.coordinator.Unlock()
 		return nil, err
 	}
 	abs, err := resolve(root, destination, false, false)
 	if err != nil {
+		ws.coordinator.Unlock()
 		return nil, err
 	}
-	wantKind := remotev1.WorkspaceEntryKind_WORKSPACE_ENTRY_KIND_REGULAR_FILE
-	if kind == remotev1.WorkspaceUploadKind_WORKSPACE_UPLOAD_KIND_ZIP_DIRECTORY {
-		wantKind = remotev1.WorkspaceEntryKind_WORKSPACE_ENTRY_KIND_DIRECTORY
-	} else if kind != remotev1.WorkspaceUploadKind_WORKSPACE_UPLOAD_KIND_REGULAR_FILE {
+	if kind != remotev1.WorkspaceUploadKind_WORKSPACE_UPLOAD_KIND_REGULAR_FILE && kind != remotev1.WorkspaceUploadKind_WORKSPACE_UPLOAD_KIND_ZIP_DIRECTORY {
+		ws.coordinator.Unlock()
 		return nil, workspaceErr(remotev1.ErrorCode_ERROR_CODE_INVALID_REQUEST, "upload kind is required")
 	}
-	if err := s.validateMutation(ws, abs, condition, expectedRevision, token, wantKind); err != nil {
+	if err := validateMutationState(ws, token); err != nil {
+		ws.coordinator.Unlock()
+		return nil, err
+	}
+	if err := validateUploadTarget(abs); err != nil {
+		ws.coordinator.Unlock()
 		return nil, err
 	}
 	backup, err := stageTarget(abs)
 	if err != nil {
+		ws.coordinator.Unlock()
 		return nil, err
 	}
 	if kind == remotev1.WorkspaceUploadKind_WORKSPACE_UPLOAD_KIND_REGULAR_FILE {
 		if err := atomicFile(abs, content); err != nil {
+			ws.coordinator.Unlock()
 			return nil, rollbackMutation(backup, err)
 		}
-	} else if err := s.extractZIPAtomic(abs, content); err != nil {
+	} else if err := s.extractZIPAtomic(ctx, abs, content); err != nil {
+		ws.coordinator.Unlock()
 		return nil, rollbackMutation(backup, err)
 	}
-	entry, err := entryMetadata(root, destination, s.config.MaxTextFileBytes)
+	entry, err := entryMetadata(root, destination, s.config.MaxTextFileBytes, true)
 	if err != nil {
+		ws.coordinator.Unlock()
 		return nil, rollbackMutation(backup, err)
 	}
-	if err := s.mutationCommittedLocked(ctx, codexID, ws); err != nil {
+	ws.mu.Lock()
+	previous, state := s.advanceMutationLocked(ws)
+	pending := beginPendingLocked(ws)
+	sink := s.stateSink()
+	ws.mu.Unlock()
+	ws.coordinator.Unlock()
+	if err := emit(ctx, sink, codexID, state); err != nil {
 		if errors.Is(err, persistence.ErrEventCommitOutcomeUnknown) {
 			backup.discard()
+			finishPending(ws, pending)
 			return nil, err
 		}
+		s.rollbackState(ws, state, previous)
+		finishPending(ws, pending)
 		return nil, rollbackMutation(backup, err)
 	}
+	finishPending(ws, pending)
 	backup.discard()
 	return entry, nil
 }
 
-func (s *Service) Download(codexID, relative string) (*remotev1.WorkspaceEntry, remotev1.WorkspaceDownloadKind, string, []byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *Service) Download(ctx context.Context, codexID, relative string) (*remotev1.WorkspaceEntry, remotev1.WorkspaceDownloadKind, string, []byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, 0, "", nil, err
+	}
 	ws, err := s.known(codexID)
 	if err != nil {
 		return nil, 0, "", nil, err
 	}
-	root, err := availableRoot(ws)
+	ws.coordinator.RLock()
+	defer ws.coordinator.RUnlock()
+	root, err := rootForAccess(ws)
 	if err != nil {
 		return nil, 0, "", nil, err
 	}
@@ -405,7 +635,7 @@ func (s *Service) Download(codexID, relative string) (*remotev1.WorkspaceEntry, 
 	if err != nil {
 		return nil, 0, "", nil, err
 	}
-	entry, err := entryMetadata(root, relative, s.config.MaxTextFileBytes)
+	entry, err := entryMetadata(root, relative, s.config.MaxTextFileBytes, false)
 	if err != nil {
 		return nil, 0, "", nil, err
 	}
@@ -413,13 +643,13 @@ func (s *Service) Download(codexID, relative string) (*remotev1.WorkspaceEntry, 
 		if uint64(info.Size()) > s.config.MaxInlineDownloadBytes {
 			return nil, 0, "", nil, workspaceErr(remotev1.ErrorCode_ERROR_CODE_WORKSPACE_DOWNLOAD_TOO_LARGE, "download exceeds hard limit")
 		}
-		content, err := os.ReadFile(abs)
+		content, err := readFileContext(ctx, abs)
 		return entry, remotev1.WorkspaceDownloadKind_WORKSPACE_DOWNLOAD_KIND_REGULAR_FILE, filepath.Base(abs), content, err
 	}
 	if !info.IsDir() {
 		return nil, 0, "", nil, workspaceErr(remotev1.ErrorCode_ERROR_CODE_WORKSPACE_ENTRY_TYPE_UNSUPPORTED, "entry type cannot be downloaded")
 	}
-	content, err := s.zipDirectory(abs)
+	content, err := s.zipDirectory(ctx, abs)
 	if err != nil {
 		return nil, 0, "", nil, err
 	}
@@ -427,28 +657,39 @@ func (s *Service) Download(codexID, relative string) (*remotev1.WorkspaceEntry, 
 }
 
 func (s *Service) known(id string) (*workspaceState, error) {
+	s.mu.RLock()
 	ws := s.states[id]
+	s.mu.RUnlock()
 	if ws == nil {
 		return nil, workspaceErr(remotev1.ErrorCode_ERROR_CODE_CODEX_NOT_FOUND, "codex not found")
 	}
 	return ws, nil
 }
-func (s *Service) emitLocked(ctx context.Context, id string, ws *workspaceState) error {
-	if s.sink == nil {
+func (s *Service) stateSink() StateSink {
+	s.mu.RLock()
+	sink := s.sink
+	s.mu.RUnlock()
+	return sink
+}
+func emit(ctx context.Context, sink StateSink, id string, state *remotev1.WorkspaceAccessState) error {
+	if sink == nil {
 		return nil
 	}
-	return s.sink(ctx, id, cloneState(ws.state))
+	return sink(ctx, id, cloneState(state))
 }
-func (s *Service) mutationCommittedLocked(ctx context.Context, id string, ws *workspaceState) error {
+func (s *Service) advanceMutationLocked(ws *workspaceState) (*remotev1.WorkspaceAccessState, *remotev1.WorkspaceAccessState) {
 	previous := cloneState(ws.state)
 	ws.state.Generation++
 	ws.state.ObservedAtUnixMs = s.now().UnixMilli()
 	ws.state.QuiescenceToken = newToken()
-	err := s.emitLocked(ctx, id, ws)
-	if err != nil && !errors.Is(err, persistence.ErrEventCommitOutcomeUnknown) {
+	return previous, cloneState(ws.state)
+}
+func (s *Service) rollbackState(ws *workspaceState, attempted, previous *remotev1.WorkspaceAccessState) {
+	ws.mu.Lock()
+	if proto.Equal(ws.state, attempted) {
 		ws.state = previous
 	}
-	return err
+	ws.mu.Unlock()
 }
 func cloneState(v *remotev1.WorkspaceAccessState) *remotev1.WorkspaceAccessState {
 	if v == nil {
@@ -526,14 +767,6 @@ func registerRoot(root string) (string, error) {
 	}
 }
 
-func availableRoot(ws *workspaceState) (string, error) {
-	resolved, err := canonicalRoot(ws.root)
-	if err != nil {
-		return "", err
-	}
-	ws.root = resolved
-	return resolved, nil
-}
 func canonicalRelative(relative string, allowRoot bool) error {
 	if relative == "" {
 		if allowRoot {
@@ -585,7 +818,7 @@ func resolve(root, relative string, allowRoot, mustExist bool) (string, error) {
 	return abs, nil
 }
 
-func entryMetadata(root, relative string, textLimit uint64) (*remotev1.WorkspaceEntry, error) {
+func entryMetadata(root, relative string, textLimit uint64, inspectText bool) (*remotev1.WorkspaceEntry, error) {
 	if err := canonicalRelative(relative, true); err != nil {
 		return nil, err
 	}
@@ -602,108 +835,38 @@ func entryMetadata(root, relative string, textLimit uint64) (*remotev1.Workspace
 	} else if info.Mode()&os.ModeSymlink != 0 {
 		kind = remotev1.WorkspaceEntryKind_WORKSPACE_ENTRY_KIND_SYMBOLIC_LINK
 	}
-	revision, err := strongRevision(abs)
-	if err != nil {
-		return nil, err
+	revision := ""
+	if kind == remotev1.WorkspaceEntryKind_WORKSPACE_ENTRY_KIND_REGULAR_FILE {
+		revision = metadataRevision(info)
 	}
-	viewable := false
-	if kind == remotev1.WorkspaceEntryKind_WORKSPACE_ENTRY_KIND_REGULAR_FILE && uint64(info.Size()) <= textLimit {
+	viewable := kind == remotev1.WorkspaceEntryKind_WORKSPACE_ENTRY_KIND_REGULAR_FILE && uint64(info.Size()) <= textLimit
+	if inspectText && viewable {
 		if content, err := os.ReadFile(abs); err == nil {
 			viewable = utf8.Valid(content)
+		} else {
+			viewable = false
 		}
 	}
 	return &remotev1.WorkspaceEntry{RelativePath: relative, Name: path.Base(relative), Kind: kind, SizeBytes: uint64(max(info.Size(), 0)), ModifiedAtUnixMs: info.ModTime().UnixMilli(), Revision: revision, TextViewable: viewable, TextEditable: viewable}, nil
 }
 
 func stableTextEntry(relative string, info os.FileInfo, content []byte) *remotev1.WorkspaceEntry {
-	h := sha256.New()
-	h.Write([]byte("file\x00"))
-	hashIdentity(h, info)
-	h.Write(content)
-	return &remotev1.WorkspaceEntry{RelativePath: relative, Name: path.Base(relative), Kind: remotev1.WorkspaceEntryKind_WORKSPACE_ENTRY_KIND_REGULAR_FILE, SizeBytes: uint64(len(content)), ModifiedAtUnixMs: info.ModTime().UnixMilli(), Revision: "sha256:" + hex.EncodeToString(h.Sum(nil)), TextViewable: true, TextEditable: true}
+	return &remotev1.WorkspaceEntry{RelativePath: relative, Name: path.Base(relative), Kind: remotev1.WorkspaceEntryKind_WORKSPACE_ENTRY_KIND_REGULAR_FILE, SizeBytes: uint64(len(content)), ModifiedAtUnixMs: info.ModTime().UnixMilli(), Revision: metadataRevision(info), TextViewable: true, TextEditable: true}
 }
 
-func strongRevision(target string) (string, error) {
+func metadataRevision(info os.FileInfo) string {
 	h := sha256.New()
-	info, err := os.Lstat(target)
-	if err != nil {
-		return "", err
-	}
 	if info.Mode().IsRegular() {
 		h.Write([]byte("file\x00"))
-		hashIdentity(h, info)
-		f, err := os.Open(target)
-		if err != nil {
-			return "", err
-		}
-		_, err = io.Copy(h, f)
-		f.Close()
-		if err != nil {
-			return "", err
-		}
 	} else if info.Mode()&os.ModeSymlink != 0 {
-		link, err := os.Readlink(target)
-		if err != nil {
-			return "", err
-		}
-		h.Write([]byte("symlink\x00" + link))
-		hashIdentity(h, info)
+		h.Write([]byte("symlink\x00"))
 	} else if info.IsDir() {
 		h.Write([]byte("dir\x00"))
-		hashIdentity(h, info)
-		var names []string
-		err := filepath.WalkDir(target, func(p string, d os.DirEntry, err error) error {
-			if err != nil {
-				return err
-			}
-			if p == target {
-				return nil
-			}
-			rel, err := filepath.Rel(target, p)
-			if err != nil {
-				return err
-			}
-			names = append(names, filepath.ToSlash(rel))
-			return nil
-		})
-		if err != nil {
-			return "", err
-		}
-		sort.Strings(names)
-		for _, name := range names {
-			p := filepath.Join(target, filepath.FromSlash(name))
-			i, err := os.Lstat(p)
-			if err != nil {
-				return "", err
-			}
-			h.Write([]byte(name + "\x00"))
-			hashIdentity(h, i)
-			if i.Mode().IsRegular() {
-				f, err := os.Open(p)
-				if err != nil {
-					return "", err
-				}
-				_, err = io.Copy(h, f)
-				f.Close()
-				if err != nil {
-					return "", err
-				}
-			} else if i.Mode()&os.ModeSymlink != 0 {
-				link, err := os.Readlink(p)
-				if err != nil {
-					return "", err
-				}
-				h.Write([]byte("link\x00" + link))
-			} else if i.IsDir() {
-				h.Write([]byte("dir\x00"))
-			} else {
-				h.Write([]byte("other\x00"))
-			}
-		}
 	} else {
 		h.Write([]byte("other\x00"))
 	}
-	return "sha256:" + hex.EncodeToString(h.Sum(nil)), nil
+	hashIdentity(h, info)
+	return "sha256:" + hex.EncodeToString(h.Sum(nil))
 }
 
 func hashIdentity(writer io.Writer, info os.FileInfo) {
@@ -713,10 +876,41 @@ func hashIdentity(writer io.Writer, info os.FileInfo) {
 	}
 }
 
-func (s *Service) validateMutation(ws *workspaceState, target string, condition remotev1.WorkspaceWriteCondition, expected, token string, want remotev1.WorkspaceEntryKind) error {
+type contextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (r contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	n, err := r.r.Read(p)
+	if ctxErr := r.ctx.Err(); ctxErr != nil {
+		return n, ctxErr
+	}
+	return n, err
+}
+
+func readFileContext(ctx context.Context, name string) ([]byte, error) {
+	f, err := os.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(contextReader{ctx: ctx, r: f})
+}
+
+func validateMutationState(ws *workspaceState, token string) error {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
 	if ws.state.ActiveAgentCount != 0 || ws.state.MutationStatus != remotev1.WorkspaceMutationStatus_WORKSPACE_MUTATION_STATUS_ALLOWED || token == "" || token != ws.state.QuiescenceToken {
 		return workspaceErr(remotev1.ErrorCode_ERROR_CODE_WORKSPACE_BUSY, "workspace is busy or quiescence token is stale")
 	}
+	return nil
+}
+
+func validateMutationTarget(target string, condition remotev1.WorkspaceWriteCondition, expected string, want remotev1.WorkspaceEntryKind) error {
 	info, err := os.Lstat(target)
 	exists := err == nil
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -757,14 +951,25 @@ func (s *Service) validateMutation(ws *workspaceState, target string, condition 
 			return workspaceErr(remotev1.ErrorCode_ERROR_CODE_CONFLICT, "target kind conflicts with request")
 		}
 		if expected != "" {
-			revision, err := strongRevision(target)
-			if err != nil {
-				return err
-			}
+			revision := metadataRevision(info)
 			if revision != expected {
 				return workspaceErr(remotev1.ErrorCode_ERROR_CODE_WORKSPACE_REVISION_CONFLICT, "workspace revision changed")
 			}
 		}
+	}
+	return nil
+}
+
+func validateUploadTarget(target string) error {
+	info, err := os.Lstat(target)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() && !info.IsDir() {
+		return workspaceErr(remotev1.ErrorCode_ERROR_CODE_WORKSPACE_ENTRY_TYPE_UNSUPPORTED, "upload target is a symbolic link or unsupported entry")
 	}
 	return nil
 }
@@ -839,7 +1044,7 @@ func rollbackMutation(backup *targetBackup, cause error) error {
 	return cause
 }
 
-func (s *Service) extractZIPAtomic(target string, content []byte) error {
+func (s *Service) extractZIPAtomic(ctx context.Context, target string, content []byte) error {
 	reader, err := zip.NewReader(bytes.NewReader(content), int64(len(content)))
 	if err != nil {
 		return workspaceErr(remotev1.ErrorCode_ERROR_CODE_WORKSPACE_ARCHIVE_INVALID, "invalid ZIP archive")
@@ -856,6 +1061,9 @@ func (s *Service) extractZIPAtomic(target string, content []byte) error {
 	seen := make(map[string]struct{})
 	var expanded uint64
 	for _, item := range reader.File {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		name := strings.TrimSuffix(item.Name, "/")
 		if err := canonicalRelative(name, false); err != nil {
 			return workspaceErr(remotev1.ErrorCode_ERROR_CODE_WORKSPACE_ARCHIVE_INVALID, "archive path is invalid")
@@ -891,7 +1099,7 @@ func (s *Service) extractZIPAtomic(target string, content []byte) error {
 		}
 		out, err := os.OpenFile(dest, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 		if err == nil {
-			_, err = io.Copy(out, io.LimitReader(src, int64(s.config.MaxArchiveExpandedBytes)+1))
+			_, err = io.Copy(out, contextReader{ctx: ctx, r: io.LimitReader(src, int64(s.config.MaxArchiveExpandedBytes)+1)})
 		}
 		src.Close()
 		if out != nil {
@@ -927,7 +1135,7 @@ func replaceTree(target, staging string) error {
 	return nil
 }
 
-func (s *Service) zipDirectory(root string) ([]byte, error) {
+func (s *Service) zipDirectory(ctx context.Context, root string) ([]byte, error) {
 	type node struct {
 		abs, rel string
 		info     os.FileInfo
@@ -935,6 +1143,9 @@ func (s *Service) zipDirectory(root string) ([]byte, error) {
 	var nodes []node
 	var expanded uint64
 	err := filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		if err != nil {
 			return err
 		}
@@ -964,6 +1175,9 @@ func (s *Service) zipDirectory(root string) ([]byte, error) {
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)
 	for _, node := range nodes {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		name := node.rel
 		if node.info.IsDir() {
 			name += "/"
@@ -983,7 +1197,7 @@ func (s *Service) zipDirectory(root string) ([]byte, error) {
 			if err != nil {
 				return nil, err
 			}
-			_, err = io.Copy(w, f)
+			_, err = io.Copy(w, contextReader{ctx: ctx, r: f})
 			f.Close()
 			if err != nil {
 				return nil, err

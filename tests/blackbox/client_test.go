@@ -132,11 +132,11 @@ func (c *wireClient) hello(t *testing.T) *remotev1.ServerHello {
 	t.Helper()
 	c.writeFrame(t, &remotev1.Frame{Payload: &remotev1.Frame_ClientHello{ClientHello: &remotev1.ClientHello{
 		ClientId: "blackbox-client", ClientRunId: fmt.Sprintf("run-%d", time.Now().UnixNano()),
-		ProtocolVersion: &remotev1.ProtocolVersion{Major: 1, Minor: 1}, ClientName: "blackbox", ClientVersion: "test",
+		ProtocolVersion: &remotev1.ProtocolVersion{Major: 1, Minor: 1, Patch: 2}, ClientName: "blackbox", ClientVersion: "test",
 	}}})
 	hello := c.readUntil(t, func(f *remotev1.Frame) bool { return f.GetServerHello() != nil }).GetServerHello()
-	if hello.ProtocolVersion == nil || hello.ProtocolVersion.Major != 1 || hello.ProtocolVersion.Minor != 1 {
-		t.Fatalf("server protocol=%v, want 1.1", hello.ProtocolVersion)
+	if hello.ProtocolVersion == nil || hello.ProtocolVersion.Major != 1 || hello.ProtocolVersion.Minor != 1 || hello.ProtocolVersion.Patch != 2 {
+		t.Fatalf("server protocol=%v, want 1.1.2", hello.ProtocolVersion)
 	}
 	if hello.ConnectionId == "" || hello.HostId == "" || hello.HostRunId == "" {
 		t.Fatalf("server hello missing identities: %+v", hello)
@@ -150,6 +150,54 @@ func (c *wireClient) request(t *testing.T, request *remotev1.Request) *remotev1.
 	return c.readUntil(t, func(f *remotev1.Frame) bool {
 		return f.GetResponse() != nil && f.GetResponse().RequestId == request.RequestId
 	}).GetResponse()
+}
+
+// requestContext is the non-fatal, deadline-aware variant used by concurrency
+// tests. Callers must not issue another read on c while it is in progress.
+func (c *wireClient) requestContext(ctx context.Context, request *remotev1.Request) (*remotev1.Response, error) {
+	raw, err := protojson.MarshalOptions{UseProtoNames: false}.Marshal(&remotev1.Frame{Payload: &remotev1.Frame_Request{Request: request}})
+	if err != nil {
+		return nil, fmt.Errorf("marshal request frame: %w", err)
+	}
+	c.mu.Lock()
+	err = c.conn.Write(ctx, websocket.MessageText, raw)
+	c.mu.Unlock()
+	if err != nil {
+		return nil, fmt.Errorf("write request frame: %w", err)
+	}
+
+	for {
+		typ, raw, err := c.conn.Read(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("read response frame: %w", err)
+		}
+		if typ != websocket.MessageText {
+			return nil, fmt.Errorf("message type=%v, want text", typ)
+		}
+		frame := new(remotev1.Frame)
+		if err := strictJSON.Unmarshal(raw, frame); err != nil {
+			return nil, fmt.Errorf("decode ProtoJSON frame: %w", err)
+		}
+		if ping := frame.GetPing(); ping != nil {
+			pongRaw, err := protojson.MarshalOptions{UseProtoNames: false}.Marshal(&remotev1.Frame{Payload: &remotev1.Frame_Pong{Pong: &remotev1.Pong{
+				Nonce: ping.Nonce, PingSentAtUnixMs: ping.SentAtUnixMs, PongSentAtUnixMs: time.Now().UnixMilli(),
+			}}})
+			if err != nil {
+				return nil, fmt.Errorf("marshal pong frame: %w", err)
+			}
+			c.mu.Lock()
+			err = c.conn.Write(ctx, websocket.MessageText, pongRaw)
+			c.mu.Unlock()
+			if err != nil {
+				return nil, fmt.Errorf("write pong frame: %w", err)
+			}
+			continue
+		}
+		if response := frame.GetResponse(); response != nil && response.RequestId == request.RequestId {
+			return response, nil
+		}
+		c.inbox = append(c.inbox, frame)
+	}
 }
 
 func expectClose(t *testing.T, c *wireClient) websocket.CloseError {

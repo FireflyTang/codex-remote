@@ -207,6 +207,10 @@ func request(id string, body any) *remotev1.Request {
 		r.Request = x
 	case *remotev1.Request_UnmanageCodex:
 		r.Request = x
+	case *remotev1.Request_RenameCodex:
+		r.Request = x
+	case *remotev1.Request_ForgetCodex:
+		r.Request = x
 	case *remotev1.Request_GetWorkspace:
 		r.Request = x
 	case *remotev1.Request_ListWorkspaceEntries:
