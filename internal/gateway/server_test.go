@@ -44,6 +44,8 @@ type testBackend struct {
 	forgets          int
 	workspaceWrites  int
 	workspaceUploads int
+	imageUploads     int
+	imageDownloads   int
 	unmanageErr      error
 }
 
@@ -124,6 +126,14 @@ func (b *testBackend) UploadWorkspaceEntry(context.Context, *remotev1.UploadWork
 }
 func (*testBackend) DownloadWorkspaceEntry(context.Context, *remotev1.DownloadWorkspaceEntryRequest) (*remotev1.DownloadWorkspaceEntryResponse, error) {
 	return &remotev1.DownloadWorkspaceEntryResponse{Filename: "a.txt", Content: []byte("hello")}, nil
+}
+func (b *testBackend) UploadImageAttachment(context.Context, *remotev1.UploadImageAttachmentRequest) (*remotev1.UploadImageAttachmentResponse, error) {
+	b.imageUploads++
+	return &remotev1.UploadImageAttachmentResponse{Attachment: &remotev1.ImageAttachment{AttachmentId: "image-1", MimeType: "image/png", SizeBytes: 3}}, nil
+}
+func (b *testBackend) DownloadImageAttachment(context.Context, *remotev1.DownloadImageAttachmentRequest) (*remotev1.DownloadImageAttachmentResponse, error) {
+	b.imageDownloads++
+	return &remotev1.DownloadImageAttachmentResponse{Attachment: &remotev1.ImageAttachment{AttachmentId: "image-1", MimeType: "image/png", SizeBytes: 3}, Content: []byte("png")}, nil
 }
 
 func TestDispatcherPersistsSideEffectDedup(t *testing.T) {
@@ -247,6 +257,36 @@ func TestDispatcherWorkspaceQueriesAndMutationDedup(t *testing.T) {
 	}
 }
 
+func TestDispatcherImageUploadDedupAndDownloadQuery(t *testing.T) {
+	p, err := persistence.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	b := new(testBackend)
+	d := &Dispatcher{Backend: b, Dedup: p}
+	upload := &remotev1.Request{RequestId: "upload-image", Request: &remotev1.Request_UploadImageAttachment{UploadImageAttachment: &remotev1.UploadImageAttachmentRequest{CodexId: "c", Filename: "a.png", MimeType: "image/png", Content: []byte("png"), Sha256: strings.Repeat("0", 64)}}}
+	first, err := d.Dispatch(context.Background(), upload)
+	if err != nil || first.GetUploadImageAttachment() == nil || first.GetUploadImageAttachment().GetDeduplicated() {
+		t.Fatalf("first image upload = %+v, %v", first, err)
+	}
+	second, err := d.Dispatch(context.Background(), upload)
+	if err != nil || second.GetUploadImageAttachment() == nil || !second.GetUploadImageAttachment().GetDeduplicated() || b.imageUploads != 1 {
+		t.Fatalf("deduplicated image upload = %+v, calls=%d, err=%v", second, b.imageUploads, err)
+	}
+
+	download := &remotev1.Request{RequestId: "download-image", Request: &remotev1.Request_DownloadImageAttachment{DownloadImageAttachment: &remotev1.DownloadImageAttachmentRequest{CodexId: "c", AttachmentId: "image-1"}}}
+	for range 2 {
+		resp, dispatchErr := d.Dispatch(context.Background(), download)
+		if dispatchErr != nil || resp.GetDownloadImageAttachment() == nil {
+			t.Fatalf("image download = %+v, %v", resp, dispatchErr)
+		}
+	}
+	if b.imageDownloads != 2 {
+		t.Fatalf("download query was unexpectedly deduplicated: calls=%d", b.imageDownloads)
+	}
+}
+
 func TestWorkspaceOperationClassification(t *testing.T) {
 	tests := []struct {
 		req        *remotev1.Request
@@ -261,6 +301,8 @@ func TestWorkspaceOperationClassification(t *testing.T) {
 		{req: &remotev1.Request{Request: &remotev1.Request_DownloadWorkspaceEntry{}}, operation: "download_workspace_entry"},
 		{req: &remotev1.Request{Request: &remotev1.Request_RenameCodex{}}, operation: "rename_codex", sideEffect: true},
 		{req: &remotev1.Request{Request: &remotev1.Request_ForgetCodex{}}, operation: "forget_codex", sideEffect: true},
+		{req: &remotev1.Request{Request: &remotev1.Request_UploadImageAttachment{}}, operation: "upload_image_attachment", sideEffect: true},
+		{req: &remotev1.Request{Request: &remotev1.Request_DownloadImageAttachment{}}, operation: "download_image_attachment"},
 	}
 	for _, test := range tests {
 		op, sideEffect := operation(test.req)
@@ -297,7 +339,10 @@ func TestWebSocketHelloRPCWatchAndUnwatch(t *testing.T) {
 	}
 	events := activity.NewStore(p, nil, 8)
 	backend := new(testBackend)
-	srv := NewServer(ServerConfig{HostID: "host", HostRunID: "run", HeartbeatInterval: time.Hour, ConnectionTimeout: 2 * time.Hour}, &Dispatcher{Backend: backend, Dedup: p}, events, testIdentity{}, nil)
+	imageCapabilities := &remotev1.ImageAttachmentCapabilities{Supported: true, MaxUploadBytes: 1024, SupportedMimeTypes: []string{"image/png"}, UnreferencedRetentionMs: 1000}
+	srv := NewServer(ServerConfig{HostID: "host", HostRunID: "run", HeartbeatInterval: time.Hour, ConnectionTimeout: 2 * time.Hour, Hello: func(context.Context) (*remotev1.ServerHello, error) {
+		return &remotev1.ServerHello{Capabilities: &remotev1.Capabilities{ImageAttachments: imageCapabilities}}, nil
+	}}, &Dispatcher{Backend: backend, Dedup: p}, events, testIdentity{}, nil)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -315,8 +360,8 @@ func TestWebSocketHelloRPCWatchAndUnwatch(t *testing.T) {
 		t.Fatalf("dial status=%v err=%v", resp, err)
 	}
 	defer ws.CloseNow()
-	writeFrame(t, ctx, ws, &remotev1.Frame{Payload: &remotev1.Frame_ClientHello{ClientHello: &remotev1.ClientHello{ClientId: "client", ClientRunId: "client-run", ProtocolVersion: &remotev1.ProtocolVersion{Major: 1, Minor: 1, Patch: 2}}}})
-	if got := readFrame(t, ctx, ws).GetServerHello(); got == nil || got.ConnectionId == "" || got.GetProtocolVersion().GetMajor() != 1 || got.GetProtocolVersion().GetMinor() != 1 || got.GetProtocolVersion().GetPatch() != 2 {
+	writeFrame(t, ctx, ws, &remotev1.Frame{Payload: &remotev1.Frame_ClientHello{ClientHello: &remotev1.ClientHello{ClientId: "client", ClientRunId: "client-run", ProtocolVersion: &remotev1.ProtocolVersion{Major: 1, Minor: 2, Patch: 0}}}})
+	if got := readFrame(t, ctx, ws).GetServerHello(); got == nil || got.ConnectionId == "" || got.GetProtocolVersion().GetMajor() != 1 || got.GetProtocolVersion().GetMinor() != 2 || got.GetProtocolVersion().GetPatch() != 0 || got.GetCapabilities().GetImageAttachments().GetMaxUploadBytes() != 1024 {
 		t.Fatalf("hello %+v", got)
 	}
 	writeFrame(t, ctx, ws, &remotev1.Frame{Payload: &remotev1.Frame_Request{Request: &remotev1.Request{RequestId: "host", Request: &remotev1.Request_GetHost{GetHost: &remotev1.GetHostRequest{}}}}})
@@ -369,7 +414,7 @@ func TestConnectRejectsMissingSubprotocol(t *testing.T) {
 	<-done
 }
 
-func TestHandshakeRejectsNonV112(t *testing.T) {
+func TestHandshakeRejectsNonV120(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	s := NewServer(ServerConfig{HeartbeatInterval: time.Hour, ConnectionTimeout: time.Hour}, &Dispatcher{Backend: new(testBackend)}, nil, testIdentity{}, nil)
@@ -389,9 +434,9 @@ func TestHandshakeRejectsNonV112(t *testing.T) {
 		name    string
 		version *remotev1.ProtocolVersion
 	}{
-		{name: "minor", version: &remotev1.ProtocolVersion{Major: 1, Minor: 0, Patch: 2}},
-		{name: "missing patch", version: &remotev1.ProtocolVersion{Major: 1, Minor: 1}},
-		{name: "other patch", version: &remotev1.ProtocolVersion{Major: 1, Minor: 1, Patch: 1}},
+		{name: "old minor", version: &remotev1.ProtocolVersion{Major: 1, Minor: 1, Patch: 2}},
+		{name: "missing minor", version: &remotev1.ProtocolVersion{Major: 1}},
+		{name: "other patch", version: &remotev1.ProtocolVersion{Major: 1, Minor: 2, Patch: 1}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			ws, resp, err := websocket.Dial(ctx, "ws://"+ln.Addr().String()+"/connect", &websocket.DialOptions{Subprotocols: []string{Subprotocol}})
@@ -685,8 +730,8 @@ func dialGateway(t *testing.T, cfg ServerConfig, backend Backend, aud WireAudito
 		<-done
 		cancel()
 	})
-	writeFrame(t, ctx, ws, &remotev1.Frame{Payload: &remotev1.Frame_ClientHello{ClientHello: &remotev1.ClientHello{ClientId: "client", ClientRunId: "client-run", ProtocolVersion: &remotev1.ProtocolVersion{Major: 1, Minor: 1, Patch: 2}}}})
-	if got := readFrame(t, ctx, ws).GetServerHello(); got == nil || got.GetProtocolVersion().GetMajor() != 1 || got.GetProtocolVersion().GetMinor() != 1 || got.GetProtocolVersion().GetPatch() != 2 {
+	writeFrame(t, ctx, ws, &remotev1.Frame{Payload: &remotev1.Frame_ClientHello{ClientHello: &remotev1.ClientHello{ClientId: "client", ClientRunId: "client-run", ProtocolVersion: &remotev1.ProtocolVersion{Major: 1, Minor: 2, Patch: 0}}}})
+	if got := readFrame(t, ctx, ws).GetServerHello(); got == nil || got.GetProtocolVersion().GetMajor() != 1 || got.GetProtocolVersion().GetMinor() != 2 || got.GetProtocolVersion().GetPatch() != 0 {
 		t.Fatalf("ServerHello = %+v", got)
 	}
 	return ws, ctx

@@ -66,6 +66,62 @@ func TestSetWorkspaceCapabilitiesRejectsZeroAndClones(t *testing.T) {
 	}
 }
 
+func TestImageAttachmentCapabilitiesFitUploadAndDownloadFrames(t *testing.T) {
+	for _, maxFrameBytes := range []int{64 << 10, 4 << 20} {
+		caps, err := ImageAttachmentCapabilitiesForFrame(uint64(maxFrameBytes))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !caps.GetSupported() || caps.GetMaxUploadBytes() == 0 || caps.GetUnreferencedRetentionMs() == 0 || len(caps.GetSupportedMimeTypes()) != 3 {
+			t.Fatalf("image capabilities = %+v", caps)
+		}
+		content := make([]byte, caps.GetMaxUploadBytes())
+		descriptor := &remotev1.ImageAttachment{AttachmentId: strings.Repeat("a", 64), Filename: "image.png", MimeType: "image/png", SizeBytes: uint64(len(content)), Sha256: strings.Repeat("0", 64)}
+		frames := []*remotev1.Frame{
+			{Payload: &remotev1.Frame_Request{Request: &remotev1.Request{RequestId: strings.Repeat("r", 64), Request: &remotev1.Request_UploadImageAttachment{UploadImageAttachment: &remotev1.UploadImageAttachmentRequest{CodexId: strings.Repeat("c", 64), Filename: "image.png", MimeType: "image/png", Content: content, Sha256: strings.Repeat("0", 64)}}}}},
+			{Payload: &remotev1.Frame_Response{Response: &remotev1.Response{RequestId: strings.Repeat("r", 64), Result: &remotev1.Response_DownloadImageAttachment{DownloadImageAttachment: &remotev1.DownloadImageAttachmentResponse{Attachment: descriptor, Content: content}}}}},
+		}
+		for _, frame := range frames {
+			raw, marshalErr := protojson.Marshal(frame)
+			if marshalErr != nil {
+				t.Fatal(marshalErr)
+			}
+			if len(raw) >= maxFrameBytes {
+				t.Fatalf("maximum image %T ProtoJSON size = %d, must fit below %d", frame.Payload, len(raw), maxFrameBytes)
+			}
+		}
+	}
+}
+
+func TestSetImageAttachmentCapabilitiesValidatesAndClones(t *testing.T) {
+	service := New(4, 20)
+	if got := service.Get().GetImageAttachments(); got != nil {
+		t.Fatalf("image capability advertised before implementation wiring: %+v", got)
+	}
+	invalid := []*remotev1.ImageAttachmentCapabilities{
+		nil,
+		{Supported: true, MaxUploadBytes: 1, SupportedMimeTypes: []string{"image/png"}},
+		{Supported: true, MaxUploadBytes: 1, SupportedMimeTypes: []string{"IMAGE/PNG"}, UnreferencedRetentionMs: 1},
+		{Supported: true, MaxUploadBytes: 1, SupportedMimeTypes: []string{"image/png; charset=x"}, UnreferencedRetentionMs: 1},
+	}
+	for _, caps := range invalid {
+		if err := service.SetImageAttachmentCapabilities(caps); err == nil {
+			t.Fatalf("invalid image capabilities accepted: %+v", caps)
+		}
+	}
+	caps, err := ImageAttachmentCapabilitiesForFrame(4 << 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.SetImageAttachmentCapabilities(caps); err != nil {
+		t.Fatal(err)
+	}
+	caps.SupportedMimeTypes[0] = "image/webp"
+	if got := service.Get().GetImageAttachments().GetSupportedMimeTypes()[0]; got != "image/png" {
+		t.Fatalf("image capabilities were not cloned: %q", got)
+	}
+}
+
 func assertWorkspaceFramesFit(t *testing.T, caps *remotev1.WorkspaceCapabilities, maxFrameBytes int) {
 	t.Helper()
 	worstCaseText := strings.Repeat("\x00", int(caps.GetMaxTextFileBytes()))

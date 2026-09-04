@@ -223,6 +223,10 @@ func request(id string, body any) *remotev1.Request {
 		r.Request = x
 	case *remotev1.Request_DownloadWorkspaceEntry:
 		r.Request = x
+	case *remotev1.Request_UploadImageAttachment:
+		r.Request = x
+	case *remotev1.Request_DownloadImageAttachment:
+		r.Request = x
 	default:
 		panic("unsupported request body")
 	}

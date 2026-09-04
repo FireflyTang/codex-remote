@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	remotev1 "github.com/FireflyTang/codex-remote-protocol/gen/go/codex/remote/v1"
 	"google.golang.org/protobuf/proto"
@@ -21,7 +22,11 @@ const (
 	DefaultMaxInlineDownloadBytes  = uint64(2 << 20)
 	DefaultMaxArchiveExpandedBytes = uint64(32 << 20)
 	DefaultMaxArchiveEntryCount    = uint32(1000)
+	DefaultMaxImageUploadBytes     = uint64(2 << 20)
+	DefaultImageRetention          = 24 * time.Hour
 )
+
+var DefaultImageMIMETypes = []string{"image/png", "image/jpeg", "image/gif"}
 
 func DefaultWorkspaceCapabilities() *remotev1.WorkspaceCapabilities {
 	return &remotev1.WorkspaceCapabilities{
@@ -51,12 +56,42 @@ func WorkspaceCapabilitiesForFrame(maxFrameBytes uint64) (*remotev1.WorkspaceCap
 	return caps, nil
 }
 
+// ImageAttachmentCapabilitiesForFrame leaves at least half the frame for the
+// ProtoJSON envelope and Base64 expansion. The attachment service must use the
+// returned maximum and MIME list as its execution limits.
+func ImageAttachmentCapabilitiesForFrame(maxFrameBytes uint64) (*remotev1.ImageAttachmentCapabilities, error) {
+	if maxFrameBytes < 2 {
+		return nil, errors.New("max frame bytes must allow a positive image payload")
+	}
+	return &remotev1.ImageAttachmentCapabilities{
+		Supported:               true,
+		MaxUploadBytes:          min(DefaultMaxImageUploadBytes, maxFrameBytes/2),
+		SupportedMimeTypes:      append([]string(nil), DefaultImageMIMETypes...),
+		UnreferencedRetentionMs: uint64(DefaultImageRetention.Milliseconds()),
+	}, nil
+}
+
 func (s *Service) SetWorkspaceCapabilities(v *remotev1.WorkspaceCapabilities) error {
 	if v == nil || v.GetMaxTextFileBytes() == 0 || v.GetMaxInlineUploadBytes() == 0 || v.GetMaxInlineDownloadBytes() == 0 || v.GetMaxArchiveExpandedBytes() == 0 || v.GetMaxArchiveEntryCount() == 0 {
 		return errors.New("all workspace capability limits must be positive")
 	}
 	s.mu.Lock()
 	s.value.Workspace = proto.Clone(v).(*remotev1.WorkspaceCapabilities)
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *Service) SetImageAttachmentCapabilities(v *remotev1.ImageAttachmentCapabilities) error {
+	if v == nil || !v.GetSupported() || v.GetMaxUploadBytes() == 0 || v.GetUnreferencedRetentionMs() == 0 || len(v.GetSupportedMimeTypes()) == 0 {
+		return errors.New("supported image attachment capabilities require positive limits and MIME types")
+	}
+	for _, mimeType := range v.GetSupportedMimeTypes() {
+		if mimeType == "" || mimeType != strings.ToLower(mimeType) || !strings.HasPrefix(mimeType, "image/") || strings.Contains(mimeType, ";") {
+			return errors.New("image attachment MIME types must be lowercase image media types without parameters")
+		}
+	}
+	s.mu.Lock()
+	s.value.ImageAttachments = proto.Clone(v).(*remotev1.ImageAttachmentCapabilities)
 	s.mu.Unlock()
 	return nil
 }

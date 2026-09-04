@@ -354,3 +354,49 @@ func TestManualTitleAndForgetRemoveCodexStateButKeepDedup(t *testing.T) {
 		t.Fatalf("forgotten candidate after consume err=%v", err)
 	}
 }
+
+func TestLogicalOwnerAndAttachmentPersistence(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "state.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, err := s.EnsureLogicalOwner(ctx, "appServer", "native-1")
+	if err != nil || owner == "" {
+		t.Fatalf("EnsureLogicalOwner owner=%q err=%v", owner, err)
+	}
+	again, err := s.EnsureLogicalOwner(ctx, "appServer", "native-1")
+	if err != nil || again != owner {
+		t.Fatalf("stable owner=%q want=%q err=%v", again, owner, err)
+	}
+	if err := s.BindLogicalOwner(ctx, "appServer", "replacement", owner); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.LogicalOwnerForSession(ctx, "appServer", "replacement"); err != nil || got != owner {
+		t.Fatalf("replacement owner=%q err=%v", got, err)
+	}
+	if err := s.BindLogicalOwner(ctx, "appServer", "replacement", "different-owner"); !errors.Is(err, ErrLogicalOwnerConflict) {
+		t.Fatalf("conflicting replacement owner err=%v", err)
+	}
+
+	record := AttachmentRecord{AttachmentID: "attachment", LogicalOwnerID: owner, Filename: "../display.png", MIMEType: "image/png", SizeBytes: 3, SHA256: strings.Repeat("a", 64), WidthPixels: 2, HeightPixels: 1, CreatedAtUnixMS: 42}
+	if err := s.SaveAttachment(ctx, record); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	got, err := s.GetAttachment(ctx, owner, record.AttachmentID)
+	if err != nil || got != record {
+		t.Fatalf("attachment=%+v want=%+v err=%v", got, record, err)
+	}
+	if _, err := s.GetAttachment(ctx, "another-owner", record.AttachmentID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("cross-owner lookup err=%v", err)
+	}
+}

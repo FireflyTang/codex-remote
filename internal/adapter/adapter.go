@@ -129,10 +129,17 @@ type UserInputOption struct {
 	Label       string `json:"label"`
 	Description string `json:"description"`
 }
-type TextInput struct {
+
+// TurnInput is one ordered app-server turn input. Codex accepts text and local
+// image paths; the latter must have been resolved and validated by the Host.
+type TurnInput struct {
 	Type string `json:"type"`
-	Text string `json:"text"`
+	Text string `json:"text,omitempty"`
+	Path string `json:"path,omitempty"`
 }
+
+// TextInput remains an alias for callers that only construct text parts.
+type TextInput = TurnInput
 type TurnOptions struct {
 	Model             string
 	ApprovalPolicy    string
@@ -209,7 +216,7 @@ func (a *Adapter) ResumeThread(ctx context.Context, id string) (Thread, error) {
 	normalizeThread(&out.Thread)
 	return out.Thread, err
 }
-func (a *Adapter) StartTurn(ctx context.Context, threadID string, input []TextInput, opt TurnOptions) (Turn, error) {
+func (a *Adapter) StartTurn(ctx context.Context, threadID string, input []TurnInput, opt TurnOptions) (Turn, error) {
 	p := map[string]any{"threadId": threadID, "input": input}
 	if opt.ApprovalPolicy != "" {
 		p["approvalPolicy"] = opt.ApprovalPolicy

@@ -3,7 +3,9 @@ package persistence
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -17,20 +19,31 @@ import (
 var ErrRequestConflict = errors.New("request id was used with a different operation")
 var ErrRequestInProgress = errors.New("request is in progress or its outcome is unknown")
 var ErrEventCommitOutcomeUnknown = errors.New("event transaction commit outcome is unknown")
+var ErrLogicalOwnerConflict = errors.New("native session is already bound to another logical owner")
 
 type Store struct{ db *sql.DB }
 
 type CodexRecord struct {
-	CodexID, ThreadID, SessionSource, CWD, Title, Origin, Status, ActiveTurnID, RuntimeVersion, ManagementState string
-	CreatedAtUnixMS, ImportedAtUnixMS, LastActivityAtUnixMS, ManagedUntilUnixMS, WarningDeadlineUnixMS          int64
-	CurrentViewJSON                                                                                             []byte
-	ManualTitleOverride                                                                                         bool
+	CodexID, ThreadID, SessionSource, LogicalOwnerID, CWD, Title, Origin, Status, ActiveTurnID, RuntimeVersion, ManagementState string
+	CreatedAtUnixMS, ImportedAtUnixMS, LastActivityAtUnixMS, ManagedUntilUnixMS, WarningDeadlineUnixMS                          int64
+	CurrentViewJSON                                                                                                             []byte
+	ManualTitleOverride                                                                                                         bool
 }
 
 type ForgottenSessionRecord struct {
-	Source, SessionID, CWD, Title, Preview, Origin string
-	CreatedAtUnixMS, UpdatedAtUnixMS               int64
-	Materialized                                   bool
+	Source, SessionID, LogicalOwnerID, CWD, Title, Preview, Origin string
+	CreatedAtUnixMS, UpdatedAtUnixMS                               int64
+	Materialized                                                   bool
+}
+
+// AttachmentRecord is the immutable metadata for a Host-owned image blob.
+// Blob paths are derived from AttachmentID by the attachment package and are
+// deliberately not persisted from client-controlled input.
+type AttachmentRecord struct {
+	AttachmentID, LogicalOwnerID, Filename, MIMEType, SHA256 string
+	SizeBytes                                                uint64
+	WidthPixels, HeightPixels                                uint32
+	CreatedAtUnixMS                                          int64
 }
 
 type DedupState int
@@ -74,7 +87,7 @@ func (s *Store) migrate(ctx context.Context) error {
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS codexes (
- codex_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, session_source TEXT NOT NULL DEFAULT 'unknown', cwd TEXT NOT NULL,
+ codex_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, session_source TEXT NOT NULL DEFAULT 'unknown', logical_owner_id TEXT NOT NULL DEFAULT '', cwd TEXT NOT NULL,
  title TEXT NOT NULL, origin TEXT NOT NULL, status TEXT NOT NULL,
  active_turn_id TEXT NOT NULL DEFAULT '', runtime_version TEXT NOT NULL DEFAULT '',
  created_at_ms INTEGER NOT NULL, imported_at_ms INTEGER NOT NULL DEFAULT 0,
@@ -98,19 +111,34 @@ CREATE TABLE IF NOT EXISTS resolved_pending (
  PRIMARY KEY(codex_id,pending_id)
 );
 CREATE TABLE IF NOT EXISTS forgotten_sessions (
- source TEXT NOT NULL, session_id TEXT NOT NULL, cwd TEXT NOT NULL,
+ source TEXT NOT NULL, session_id TEXT NOT NULL, logical_owner_id TEXT NOT NULL DEFAULT '', cwd TEXT NOT NULL,
  title TEXT NOT NULL DEFAULT '', preview TEXT NOT NULL DEFAULT '', origin TEXT NOT NULL DEFAULT '',
  created_at_ms INTEGER NOT NULL DEFAULT 0, updated_at_ms INTEGER NOT NULL DEFAULT 0,
  materialized INTEGER NOT NULL DEFAULT 0,
  PRIMARY KEY(source,session_id)
-);`)
+);
+CREATE TABLE IF NOT EXISTS session_logical_owners (
+ source TEXT NOT NULL, session_id TEXT NOT NULL, logical_owner_id TEXT NOT NULL,
+ PRIMARY KEY(source,session_id)
+);
+CREATE INDEX IF NOT EXISTS session_logical_owners_owner ON session_logical_owners(logical_owner_id);
+CREATE TABLE IF NOT EXISTS image_attachments (
+ attachment_id TEXT PRIMARY KEY, logical_owner_id TEXT NOT NULL,
+ filename TEXT NOT NULL, mime_type TEXT NOT NULL, size_bytes INTEGER NOT NULL,
+ sha256 TEXT NOT NULL, width_pixels INTEGER NOT NULL, height_pixels INTEGER NOT NULL,
+ created_at_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS image_attachments_owner ON image_attachments(logical_owner_id,attachment_id);`)
 	if err != nil {
 		return err
 	}
 	if err := s.ensureSessionSourceIdentity(ctx); err != nil {
 		return err
 	}
-	return s.ensureLifecycleColumns(ctx)
+	if err := s.ensureLifecycleColumns(ctx); err != nil {
+		return err
+	}
+	return s.ensureAttachmentOwnerColumns(ctx)
 }
 
 // ensureSessionSourceIdentity upgrades the original V1 schema, whose global
@@ -158,7 +186,7 @@ func (s *Store) ensureSessionSourceIdentity(ctx context.Context) error {
 		return err
 	}
 	if _, err = tx.ExecContext(ctx, `CREATE TABLE codexes (
- codex_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, session_source TEXT NOT NULL DEFAULT 'unknown', cwd TEXT NOT NULL,
+ codex_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, session_source TEXT NOT NULL DEFAULT 'unknown', logical_owner_id TEXT NOT NULL DEFAULT '', cwd TEXT NOT NULL,
  title TEXT NOT NULL, origin TEXT NOT NULL, status TEXT NOT NULL,
  active_turn_id TEXT NOT NULL DEFAULT '', runtime_version TEXT NOT NULL DEFAULT '',
  created_at_ms INTEGER NOT NULL, imported_at_ms INTEGER NOT NULL DEFAULT 0,
@@ -180,6 +208,27 @@ func (s *Store) ensureSessionSourceIdentity(ctx context.Context) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+func (s *Store) ensureAttachmentOwnerColumns(ctx context.Context) error {
+	for _, table := range []struct {
+		check string
+		sql   string
+	}{
+		{`SELECT count(*) FROM pragma_table_info('codexes') WHERE name='logical_owner_id'`, `ALTER TABLE codexes ADD COLUMN logical_owner_id TEXT NOT NULL DEFAULT ''`},
+		{`SELECT count(*) FROM pragma_table_info('forgotten_sessions') WHERE name='logical_owner_id'`, `ALTER TABLE forgotten_sessions ADD COLUMN logical_owner_id TEXT NOT NULL DEFAULT ''`},
+	} {
+		var count int
+		if err := s.db.QueryRowContext(ctx, table.check).Scan(&count); err != nil {
+			return err
+		}
+		if count == 0 {
+			if _, err := s.db.ExecContext(ctx, table.sql); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (s *Store) ensureLifecycleColumns(ctx context.Context) error {
@@ -268,13 +317,13 @@ func (s *Store) CompleteRequest(ctx context.Context, requestID string, responseJ
 }
 
 func (s *Store) UpsertCodex(ctx context.Context, r CodexRecord) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO codexes(codex_id,thread_id,session_source,cwd,title,origin,status,active_turn_id,runtime_version,created_at_ms,imported_at_ms,last_activity_at_ms,current_view_json,management_state,managed_until_ms,management_warning_deadline_ms,manual_title_override)
-	 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(codex_id) DO UPDATE SET thread_id=excluded.thread_id,session_source=excluded.session_source,cwd=excluded.cwd,title=excluded.title,origin=excluded.origin,status=excluded.status,active_turn_id=excluded.active_turn_id,runtime_version=excluded.runtime_version,imported_at_ms=excluded.imported_at_ms,last_activity_at_ms=excluded.last_activity_at_ms,current_view_json=excluded.current_view_json,management_state=excluded.management_state,managed_until_ms=excluded.managed_until_ms,management_warning_deadline_ms=excluded.management_warning_deadline_ms,manual_title_override=excluded.manual_title_override`,
-		r.CodexID, r.ThreadID, normalizeSessionSource(r.SessionSource), r.CWD, r.Title, r.Origin, r.Status, r.ActiveTurnID, r.RuntimeVersion, r.CreatedAtUnixMS, r.ImportedAtUnixMS, r.LastActivityAtUnixMS, nullableBytes(r.CurrentViewJSON), r.ManagementState, r.ManagedUntilUnixMS, r.WarningDeadlineUnixMS, r.ManualTitleOverride)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO codexes(codex_id,thread_id,session_source,logical_owner_id,cwd,title,origin,status,active_turn_id,runtime_version,created_at_ms,imported_at_ms,last_activity_at_ms,current_view_json,management_state,managed_until_ms,management_warning_deadline_ms,manual_title_override)
+	 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(codex_id) DO UPDATE SET thread_id=excluded.thread_id,session_source=excluded.session_source,logical_owner_id=excluded.logical_owner_id,cwd=excluded.cwd,title=excluded.title,origin=excluded.origin,status=excluded.status,active_turn_id=excluded.active_turn_id,runtime_version=excluded.runtime_version,imported_at_ms=excluded.imported_at_ms,last_activity_at_ms=excluded.last_activity_at_ms,current_view_json=excluded.current_view_json,management_state=excluded.management_state,managed_until_ms=excluded.managed_until_ms,management_warning_deadline_ms=excluded.management_warning_deadline_ms,manual_title_override=excluded.manual_title_override`,
+		r.CodexID, r.ThreadID, normalizeSessionSource(r.SessionSource), r.LogicalOwnerID, r.CWD, r.Title, r.Origin, r.Status, r.ActiveTurnID, r.RuntimeVersion, r.CreatedAtUnixMS, r.ImportedAtUnixMS, r.LastActivityAtUnixMS, nullableBytes(r.CurrentViewJSON), r.ManagementState, r.ManagedUntilUnixMS, r.WarningDeadlineUnixMS, r.ManualTitleOverride)
 	return err
 }
 
-const codexSelectColumns = `codex_id,thread_id,session_source,cwd,title,origin,status,active_turn_id,runtime_version,created_at_ms,imported_at_ms,last_activity_at_ms,current_view_json,management_state,managed_until_ms,management_warning_deadline_ms,manual_title_override`
+const codexSelectColumns = `codex_id,thread_id,session_source,logical_owner_id,cwd,title,origin,status,active_turn_id,runtime_version,created_at_ms,imported_at_ms,last_activity_at_ms,current_view_json,management_state,managed_until_ms,management_warning_deadline_ms,manual_title_override`
 
 func (s *Store) GetCodex(ctx context.Context, id string) (CodexRecord, error) {
 	return s.getCodex(ctx, `SELECT `+codexSelectColumns+` FROM codexes WHERE codex_id=?`, id)
@@ -324,7 +373,7 @@ func (s *Store) getCodex2(ctx context.Context, query, arg1, arg2 string) (CodexR
 }
 
 func scanCodex(scan func(...any) error, r *CodexRecord) error {
-	return scan(&r.CodexID, &r.ThreadID, &r.SessionSource, &r.CWD, &r.Title, &r.Origin, &r.Status, &r.ActiveTurnID, &r.RuntimeVersion, &r.CreatedAtUnixMS, &r.ImportedAtUnixMS, &r.LastActivityAtUnixMS, &r.CurrentViewJSON, &r.ManagementState, &r.ManagedUntilUnixMS, &r.WarningDeadlineUnixMS, &r.ManualTitleOverride)
+	return scan(&r.CodexID, &r.ThreadID, &r.SessionSource, &r.LogicalOwnerID, &r.CWD, &r.Title, &r.Origin, &r.Status, &r.ActiveTurnID, &r.RuntimeVersion, &r.CreatedAtUnixMS, &r.ImportedAtUnixMS, &r.LastActivityAtUnixMS, &r.CurrentViewJSON, &r.ManagementState, &r.ManagedUntilUnixMS, &r.WarningDeadlineUnixMS, &r.ManualTitleOverride)
 }
 
 // DeleteCodex removes Host-owned state while retaining global request dedup.
@@ -357,21 +406,21 @@ func (s *Store) UpsertForgottenSession(ctx context.Context, r ForgottenSessionRe
 	if strings.TrimSpace(r.SessionID) == "" || strings.TrimSpace(r.CWD) == "" {
 		return errors.New("forgotten session id and cwd are required")
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO forgotten_sessions(source,session_id,cwd,title,preview,origin,created_at_ms,updated_at_ms,materialized)
-	 VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(source,session_id) DO UPDATE SET cwd=excluded.cwd,title=excluded.title,preview=excluded.preview,origin=excluded.origin,created_at_ms=excluded.created_at_ms,updated_at_ms=excluded.updated_at_ms,materialized=excluded.materialized`,
-		normalizeSessionSource(r.Source), r.SessionID, r.CWD, r.Title, r.Preview, r.Origin, r.CreatedAtUnixMS, r.UpdatedAtUnixMS, r.Materialized)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO forgotten_sessions(source,session_id,logical_owner_id,cwd,title,preview,origin,created_at_ms,updated_at_ms,materialized)
+	 VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source,session_id) DO UPDATE SET logical_owner_id=excluded.logical_owner_id,cwd=excluded.cwd,title=excluded.title,preview=excluded.preview,origin=excluded.origin,created_at_ms=excluded.created_at_ms,updated_at_ms=excluded.updated_at_ms,materialized=excluded.materialized`,
+		normalizeSessionSource(r.Source), r.SessionID, r.LogicalOwnerID, r.CWD, r.Title, r.Preview, r.Origin, r.CreatedAtUnixMS, r.UpdatedAtUnixMS, r.Materialized)
 	return err
 }
 
 func (s *Store) GetForgottenSession(ctx context.Context, source, sessionID string) (ForgottenSessionRecord, error) {
 	var r ForgottenSessionRecord
-	err := s.db.QueryRowContext(ctx, `SELECT source,session_id,cwd,title,preview,origin,created_at_ms,updated_at_ms,materialized FROM forgotten_sessions WHERE source=? AND session_id=?`, normalizeSessionSource(source), sessionID).
-		Scan(&r.Source, &r.SessionID, &r.CWD, &r.Title, &r.Preview, &r.Origin, &r.CreatedAtUnixMS, &r.UpdatedAtUnixMS, &r.Materialized)
+	err := s.db.QueryRowContext(ctx, `SELECT source,session_id,logical_owner_id,cwd,title,preview,origin,created_at_ms,updated_at_ms,materialized FROM forgotten_sessions WHERE source=? AND session_id=?`, normalizeSessionSource(source), sessionID).
+		Scan(&r.Source, &r.SessionID, &r.LogicalOwnerID, &r.CWD, &r.Title, &r.Preview, &r.Origin, &r.CreatedAtUnixMS, &r.UpdatedAtUnixMS, &r.Materialized)
 	return r, err
 }
 
 func (s *Store) ListForgottenSessions(ctx context.Context, cwd string) ([]ForgottenSessionRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT source,session_id,cwd,title,preview,origin,created_at_ms,updated_at_ms,materialized FROM forgotten_sessions WHERE cwd=? ORDER BY updated_at_ms DESC,source,session_id`, cwd)
+	rows, err := s.db.QueryContext(ctx, `SELECT source,session_id,logical_owner_id,cwd,title,preview,origin,created_at_ms,updated_at_ms,materialized FROM forgotten_sessions WHERE cwd=? ORDER BY updated_at_ms DESC,source,session_id`, cwd)
 	if err != nil {
 		return nil, err
 	}
@@ -379,7 +428,7 @@ func (s *Store) ListForgottenSessions(ctx context.Context, cwd string) ([]Forgot
 	var out []ForgottenSessionRecord
 	for rows.Next() {
 		var r ForgottenSessionRecord
-		if err := rows.Scan(&r.Source, &r.SessionID, &r.CWD, &r.Title, &r.Preview, &r.Origin, &r.CreatedAtUnixMS, &r.UpdatedAtUnixMS, &r.Materialized); err != nil {
+		if err := rows.Scan(&r.Source, &r.SessionID, &r.LogicalOwnerID, &r.CWD, &r.Title, &r.Preview, &r.Origin, &r.CreatedAtUnixMS, &r.UpdatedAtUnixMS, &r.Materialized); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -390,6 +439,85 @@ func (s *Store) ListForgottenSessions(ctx context.Context, cwd string) ([]Forgot
 func (s *Store) DeleteForgottenSession(ctx context.Context, source, sessionID string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM forgotten_sessions WHERE source=? AND session_id=?`, normalizeSessionSource(source), sessionID)
 	return err
+}
+
+// EnsureLogicalOwner returns the stable private owner for a native session,
+// creating one when the session is first observed.
+func (s *Store) EnsureLogicalOwner(ctx context.Context, source, sessionID string) (string, error) {
+	source = normalizeSessionSource(source)
+	if strings.TrimSpace(sessionID) == "" {
+		return "", errors.New("session id is required")
+	}
+	ownerID, err := newOpaqueID()
+	if err != nil {
+		return "", err
+	}
+	if _, err = s.db.ExecContext(ctx, `INSERT INTO session_logical_owners(source,session_id,logical_owner_id) VALUES(?,?,?) ON CONFLICT(source,session_id) DO NOTHING`, source, sessionID, ownerID); err != nil {
+		return "", err
+	}
+	return s.LogicalOwnerForSession(ctx, source, sessionID)
+}
+
+// BindLogicalOwner assigns a replacement or newly discovered native thread to
+// an existing logical owner. One owner may intentionally have multiple native
+// session identities over its lifetime.
+func (s *Store) BindLogicalOwner(ctx context.Context, source, sessionID, ownerID string) error {
+	source = normalizeSessionSource(source)
+	if strings.TrimSpace(sessionID) == "" || strings.TrimSpace(ownerID) == "" {
+		return errors.New("session id and logical owner id are required")
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO session_logical_owners(source,session_id,logical_owner_id) VALUES(?,?,?) ON CONFLICT(source,session_id) DO NOTHING`, source, sessionID, ownerID); err != nil {
+		return err
+	}
+	existing, err := s.LogicalOwnerForSession(ctx, source, sessionID)
+	if err != nil {
+		return err
+	}
+	if existing != ownerID {
+		return ErrLogicalOwnerConflict
+	}
+	return nil
+}
+
+func (s *Store) LogicalOwnerForSession(ctx context.Context, source, sessionID string) (string, error) {
+	var ownerID string
+	err := s.db.QueryRowContext(ctx, `SELECT logical_owner_id FROM session_logical_owners WHERE source=? AND session_id=?`, normalizeSessionSource(source), sessionID).Scan(&ownerID)
+	return ownerID, err
+}
+
+func (s *Store) SaveAttachment(ctx context.Context, r AttachmentRecord) error {
+	if strings.TrimSpace(r.AttachmentID) == "" || strings.TrimSpace(r.LogicalOwnerID) == "" {
+		return errors.New("attachment id and logical owner id are required")
+	}
+	if r.SizeBytes > uint64(^uint64(0)>>1) {
+		return errors.New("attachment size is too large to persist")
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO image_attachments(attachment_id,logical_owner_id,filename,mime_type,size_bytes,sha256,width_pixels,height_pixels,created_at_ms) VALUES(?,?,?,?,?,?,?,?,?)`,
+		r.AttachmentID, r.LogicalOwnerID, r.Filename, r.MIMEType, int64(r.SizeBytes), r.SHA256, r.WidthPixels, r.HeightPixels, r.CreatedAtUnixMS)
+	return err
+}
+
+func (s *Store) GetAttachment(ctx context.Context, logicalOwnerID, attachmentID string) (AttachmentRecord, error) {
+	var r AttachmentRecord
+	var size int64
+	err := s.db.QueryRowContext(ctx, `SELECT attachment_id,logical_owner_id,filename,mime_type,size_bytes,sha256,width_pixels,height_pixels,created_at_ms FROM image_attachments WHERE logical_owner_id=? AND attachment_id=?`, logicalOwnerID, attachmentID).
+		Scan(&r.AttachmentID, &r.LogicalOwnerID, &r.Filename, &r.MIMEType, &size, &r.SHA256, &r.WidthPixels, &r.HeightPixels, &r.CreatedAtUnixMS)
+	if err != nil {
+		return AttachmentRecord{}, err
+	}
+	if size < 0 {
+		return AttachmentRecord{}, errors.New("persisted attachment size is negative")
+	}
+	r.SizeBytes = uint64(size)
+	return r, nil
+}
+
+func newOpaqueID() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(raw[:]), nil
 }
 
 func (s *Store) SetCurrentView(ctx context.Context, codexID string, viewJSON []byte) error {

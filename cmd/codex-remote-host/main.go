@@ -17,6 +17,7 @@ import (
 	remotev1 "github.com/FireflyTang/codex-remote-protocol/gen/go/codex/remote/v1"
 	"github.com/kylin1993/codex-remote/internal/activity"
 	"github.com/kylin1993/codex-remote/internal/adapter"
+	"github.com/kylin1993/codex-remote/internal/attachment"
 	"github.com/kylin1993/codex-remote/internal/audit"
 	"github.com/kylin1993/codex-remote/internal/capability"
 	"github.com/kylin1993/codex-remote/internal/codex"
@@ -147,8 +148,23 @@ func run() error {
 	if err := caps.SetWorkspaceCapabilities(workspaceService.Capabilities()); err != nil {
 		return fmt.Errorf("advertise workspace: %w", err)
 	}
+	imageCapabilities, err := capability.ImageAttachmentCapabilitiesForFrame(uint64(cfg.maxFrame))
+	if err != nil {
+		return fmt.Errorf("configure image attachments: %w", err)
+	}
+	attachmentService, err := attachment.New(filepath.Join(cfg.dataDir, "attachments"), store, attachment.Config{
+		MaxUploadBytes:     imageCapabilities.GetMaxUploadBytes(),
+		SupportedMIMETypes: append([]string(nil), imageCapabilities.GetSupportedMimeTypes()...),
+	})
+	if err != nil {
+		return fmt.Errorf("open image attachment store: %w", err)
+	}
+	if err := caps.SetImageAttachmentCapabilities(imageCapabilities); err != nil {
+		return fmt.Errorf("advertise image attachments: %w", err)
+	}
 	manager := codex.NewManager(runtimeManager, store, eventStore, directory.Service{}, caps, hostID, version)
 	manager.SetWorkspaceService(workspaceService)
+	manager.SetAttachmentService(attachmentService)
 	manager.MaxPage = uint32(cfg.maxPage)
 	manager.ContentBudget = cfg.maxFrame / 2
 	manager.Degraded = recorder.Degraded

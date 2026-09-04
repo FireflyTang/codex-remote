@@ -2,6 +2,7 @@ package codex
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	remotev1 "github.com/FireflyTang/codex-remote-protocol/gen/go/codex/remote/v1"
@@ -14,7 +15,7 @@ func TestTranslateStructuredItemKinds(t *testing.T) {
 		raw  string
 		want func(*remotev1.Item) bool
 	}{
-		{"user", `{"id":"u","type":"userMessage","input":[{"type":"text","text":"hello"}]}`, func(i *remotev1.Item) bool { return i.GetUserMessage().Input[0].GetText().Text == "hello" }},
+		{"user", `{"id":"u","type":"userMessage","input":[{"type":"text","text":"hello"}]}`, func(i *remotev1.Item) bool { return i.GetUserMessage().Parts[0].GetText().Text == "hello" }},
 		{"agent", `{"id":"a","type":"agentMessage","text":"answer"}`, func(i *remotev1.Item) bool { return i.GetAgentMessage().Text == "answer" }},
 		{"reasoning", `{"id":"r","type":"reasoning","summary":"why"}`, func(i *remotev1.Item) bool { return i.GetReasoningSummary().Text == "why" }},
 		{"plan", `{"id":"p","type":"plan","steps":[{"text":"one","status":"completed"}]}`, func(i *remotev1.Item) bool { return i.GetPlan().Steps[0].Text == "one" }},
@@ -33,6 +34,28 @@ func TestTranslateStructuredItemKinds(t *testing.T) {
 				t.Fatalf("translated item: %+v", item)
 			}
 		})
+	}
+}
+
+func TestTranslateUserMessagePreservesMixedPartOrderWithoutExposingPath(t *testing.T) {
+	raw := json.RawMessage(`{"id":"u","type":"userMessage","content":[{"type":"text","text":"before"},{"type":"localImage","path":"/private/blob"},{"type":"text","text":"after"}]}`)
+	descriptor := &remotev1.ImageAttachment{AttachmentId: "att-1", Filename: "image.png", MimeType: "image/png", SizeBytes: 12, Sha256: "abc"}
+	item := translateItem(raw, "turn", "fallback", "item/completed", adapter.SemanticUnknown, remotev1.ItemStatus_ITEM_STATUS_COMPLETED, 4096, remotev1.ProvenanceKind_PROVENANCE_KIND_IMPORTED_HISTORY, func(path string) (*remotev1.ImageAttachment, error) {
+		if path != "/private/blob" {
+			t.Fatalf("path=%q", path)
+		}
+		return descriptor, nil
+	})
+	parts := item.GetUserMessage().GetParts()
+	if len(parts) != 3 || parts[0].GetText().Text != "before" || parts[1].GetImage().AttachmentId != "att-1" || parts[2].GetText().Text != "after" {
+		t.Fatalf("parts=%+v", parts)
+	}
+	encoded, err := json.Marshal(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "/private/blob") {
+		t.Fatalf("private path leaked: %s", encoded)
 	}
 }
 

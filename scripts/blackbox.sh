@@ -112,7 +112,7 @@ stop_host() {
 }
 
 result=0
-scenario_list="${CODEX_REMOTE_BLACKBOX_SCENARIOS:-normal workspace interrupt approval user-input sessions unmaterialized-history unmaterialized-lifecycle lifecycle rename-forget structured failed rewatch synthetic-upsert early-large large multi-large burst audit-failure runtime-disconnect}"
+scenario_list="${CODEX_REMOTE_BLACKBOX_SCENARIOS:-normal workspace interrupt approval user-input sessions unmaterialized-history unmaterialized-lifecycle lifecycle rename-forget image-attachments structured failed rewatch synthetic-upsert early-large large multi-large burst audit-failure runtime-disconnect}"
 for scenario in ${scenario_list}; do
   start_host "${scenario}"
   run_pattern='.'
@@ -129,9 +129,28 @@ for scenario in ${scenario_list}; do
   elif [[ "${scenario}" == "unmaterialized-lifecycle" ]]; then
     run_pattern='^TestUnmaterializedUnmanagedCodexMaterializesOnStartTurn$'
   elif [[ "${scenario}" == "lifecycle" ]]; then
-    run_pattern='^Test(ManagementLifecycleOverFormalWire|HandshakeV112AndGetHost|HandshakeRejectsUnsupportedVersions)$'
+    run_pattern='^Test(ManagementLifecycleOverFormalWire|HandshakeV120AndGetHost|HandshakeRejectsUnsupportedVersions)$'
   elif [[ "${scenario}" == "rename-forget" ]]; then
     run_pattern='^TestRenameAndForgetOverFormalWire$'
+  elif [[ "${scenario}" == "image-attachments" ]]; then
+    export CODEX_REMOTE_BLACKBOX_PHASE=create
+    export CODEX_REMOTE_BLACKBOX_CHECKPOINT="${tmp_dir}/image-attachments/checkpoint.json"
+    image_create_ok=true
+    if ! "${go_bin}" test -count=1 -v -run '^TestImageAttachmentRestart' ./tests/blackbox; then
+      result=1
+      image_create_ok=false
+    fi
+    stop_host
+    if [[ "${image_create_ok}" != true ]]; then
+      unset CODEX_REMOTE_BLACKBOX_PHASE CODEX_REMOTE_BLACKBOX_CHECKPOINT
+      continue
+    fi
+    start_host "${scenario}"
+    export CODEX_REMOTE_BLACKBOX_PHASE=verify
+    if ! "${go_bin}" test -count=1 -v -run '^TestImageAttachmentRestart' ./tests/blackbox; then result=1; fi
+    stop_host
+    unset CODEX_REMOTE_BLACKBOX_PHASE CODEX_REMOTE_BLACKBOX_CHECKPOINT
+    continue
   elif [[ "${scenario}" == "workspace" ]]; then
     run_pattern='^TestWorkspace(FormalWireScenario|ListingIsShallowAndDoesNotBlockUnrelatedRPCs)$'
   elif [[ "${scenario}" == "structured" ]]; then

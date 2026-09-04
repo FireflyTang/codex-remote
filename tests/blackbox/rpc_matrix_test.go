@@ -9,7 +9,7 @@ import (
 // This table is a compile-time guard that every frozen V1 RPC has a
 // constructible formal-wire request. Behavioral scenarios use the external
 // deterministic fixture once the Host exposes its local listener seam.
-func TestAllTwentyTwoRPCsHaveFormalWireCases(t *testing.T) {
+func TestAllTwentyFourRPCsHaveFormalWireCases(t *testing.T) {
 	cases := []struct {
 		name string
 		req  *remotev1.Request
@@ -36,9 +36,11 @@ func TestAllTwentyTwoRPCsHaveFormalWireCases(t *testing.T) {
 		{"WriteWorkspaceTextFile", &remotev1.Request{Request: &remotev1.Request_WriteWorkspaceTextFile{WriteWorkspaceTextFile: &remotev1.WriteWorkspaceTextFileRequest{}}}},
 		{"UploadWorkspaceEntry", &remotev1.Request{Request: &remotev1.Request_UploadWorkspaceEntry{UploadWorkspaceEntry: &remotev1.UploadWorkspaceEntryRequest{}}}},
 		{"DownloadWorkspaceEntry", &remotev1.Request{Request: &remotev1.Request_DownloadWorkspaceEntry{DownloadWorkspaceEntry: &remotev1.DownloadWorkspaceEntryRequest{}}}},
+		{"UploadImageAttachment", &remotev1.Request{Request: &remotev1.Request_UploadImageAttachment{UploadImageAttachment: &remotev1.UploadImageAttachmentRequest{}}}},
+		{"DownloadImageAttachment", &remotev1.Request{Request: &remotev1.Request_DownloadImageAttachment{DownloadImageAttachment: &remotev1.DownloadImageAttachmentRequest{}}}},
 	}
-	if len(cases) != 22 {
-		t.Fatalf("RPC cases=%d, want 22", len(cases))
+	if len(cases) != 24 {
+		t.Fatalf("RPC cases=%d, want 24", len(cases))
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

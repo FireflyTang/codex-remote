@@ -62,7 +62,7 @@ func status(resp *http.Response) any {
 	return resp.StatusCode
 }
 
-func TestHandshakeV112AndGetHost(t *testing.T) {
+func TestHandshakeV120AndGetHost(t *testing.T) {
 	c := dial(t)
 	hello := c.hello(t)
 	resp := c.request(t, &remotev1.Request{RequestId: "get-host", Request: &remotev1.Request_GetHost{GetHost: &remotev1.GetHostRequest{}}})
@@ -80,11 +80,10 @@ func TestHandshakeRejectsUnsupportedVersions(t *testing.T) {
 		name    string
 		version *remotev1.ProtocolVersion
 	}{
-		{name: "missing-patch", version: &remotev1.ProtocolVersion{Major: 1, Minor: 1}},
-		{name: "wrong-patch-old", version: &remotev1.ProtocolVersion{Major: 1, Minor: 1, Patch: 1}},
-		{name: "wrong-patch-future", version: &remotev1.ProtocolVersion{Major: 1, Minor: 1, Patch: 3}},
-		{name: "old-minor", version: &remotev1.ProtocolVersion{Major: 1, Minor: 0, Patch: 2}},
-		{name: "future-minor", version: &remotev1.ProtocolVersion{Major: 1, Minor: 2, Patch: 2}},
+		{name: "missing-minor", version: &remotev1.ProtocolVersion{Major: 1}},
+		{name: "wrong-patch-old", version: &remotev1.ProtocolVersion{Major: 1, Minor: 2, Patch: 1}},
+		{name: "old-minor", version: &remotev1.ProtocolVersion{Major: 1, Minor: 1, Patch: 2}},
+		{name: "future-minor", version: &remotev1.ProtocolVersion{Major: 1, Minor: 3}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := dial(t)

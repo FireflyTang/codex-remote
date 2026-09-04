@@ -81,13 +81,13 @@ func (m *Manager) boundItem(item *remotev1.Item, budget int) *remotev1.Completen
 	perField := max(budget/8, 1)
 	switch content := item.Content.(type) {
 	case *remotev1.Item_UserMessage:
-		for _, input := range content.UserMessage.Input {
-			if text := input.GetText(); text != nil {
+		for _, part := range content.UserMessage.Parts {
+			if text := part.GetText(); text != nil {
 				text.Text, _ = boundString(text.Text, perField)
 			}
 		}
-		content.UserMessage.Input = boundedProtoPrefix(content.UserMessage.Input, 1, func(values []*remotev1.UserInputPart) bool {
-			content.UserMessage.Input = values
+		content.UserMessage.Parts = boundedProtoPrefix(content.UserMessage.Parts, 1, func(values []*remotev1.UserMessagePart) bool {
+			content.UserMessage.Parts = values
 			return protoJSONSize(item) <= budget
 		})
 	case *remotev1.Item_AgentMessage:

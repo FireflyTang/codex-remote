@@ -162,6 +162,67 @@ func importTestAdapter(t *testing.T, cwd string) *adapter.Adapter {
 	return ad
 }
 
+func replacementRestoreAdapter(t *testing.T, cwd string) *adapter.Adapter {
+	t.Helper()
+	tmp, err := os.CreateTemp("", "cr-replacement-*.sock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := tmp.Name()
+	_ = tmp.Close()
+	_ = os.Remove(path)
+	t.Cleanup(func() { _ = os.Remove(path) })
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		for {
+			_, raw, err := conn.Read(context.Background())
+			if err != nil {
+				return
+			}
+			var message adapter.Message
+			if json.Unmarshal(raw, &message) != nil || len(message.ID) == 0 {
+				continue
+			}
+			var response any
+			switch message.Method {
+			case "thread/read":
+				response = map[string]any{"jsonrpc": "2.0", "id": message.ID, "error": map[string]any{"code": -32004, "message": "thread not found"}}
+			case "thread/start":
+				response = map[string]any{"jsonrpc": "2.0", "id": message.ID, "result": map[string]any{"thread": map[string]any{"id": "replacement-thread", "cwd": cwd, "source": "appServer", "turns": []any{}}}}
+			default:
+				response = map[string]any{"jsonrpc": "2.0", "id": message.ID, "result": map[string]any{}}
+			}
+			encoded, _ := json.Marshal(response)
+			if conn.Write(context.Background(), websocket.MessageText, encoded) != nil {
+				return
+			}
+		}
+	})}
+	go server.Serve(listener)
+	t.Cleanup(func() {
+		_ = server.Close()
+		_ = listener.Close()
+	})
+	client, err := adapter.Dial(context.Background(), path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ad, _, err := adapter.Initialize(context.Background(), client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ad.Close() })
+	return ad
+}
+
 func testManager(t *testing.T) *Manager {
 	t.Helper()
 	m, _ := testManagerAt(t, filepath.Join(t.TempDir(), "state.db"))
@@ -1754,6 +1815,83 @@ func TestForgottenUnmaterializedSessionCanBeListedImportedAndStarted(t *testing.
 	}
 }
 
+func TestRestoreReplacesOnlySafeUnmaterializedRemoteThreadAndKeepsOwner(t *testing.T) {
+	m := testManager(t)
+	ctx := context.Background()
+	cwd := t.TempDir()
+	if err := m.Persistence.DeleteCodex(ctx, "c"); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	delete(m.byID, "c")
+	delete(m.byThread, "thread")
+	m.mu.Unlock()
+	c := &remotev1.Codex{CodexId: "replace-codex", ThreadId: "lost-thread", Cwd: cwd, Origin: remotev1.CodexOrigin_CODEX_ORIGIN_REMOTE_CREATED, Status: remotev1.CodexStatus_CODEX_STATUS_IDLE, ManagementState: remotev1.ManagementState_MANAGEMENT_STATE_MANAGED}
+	if err := m.saveCodex(ctx, c, "appServer"); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.RLock()
+	originalOwner := m.logicalOwners[c.CodexId]
+	m.mu.RUnlock()
+	m.Runtime = fixedAdapterRuntime{adapter: replacementRestoreAdapter(t, cwd)}
+	if err := m.Restore(ctx); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := m.lookup(c.CodexId)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.mu.RLock()
+	restoredOwner := m.logicalOwners[c.CodexId]
+	oldMapping := m.byThread["lost-thread"]
+	newMapping := m.byThread["replacement-thread"]
+	m.mu.RUnlock()
+	if restored.ThreadId != "replacement-thread" || restored.Status != remotev1.CodexStatus_CODEX_STATUS_IDLE || restoredOwner != originalOwner || oldMapping != "" || newMapping != c.CodexId {
+		t.Fatalf("restored=%+v originalOwner=%q restoredOwner=%q old=%q new=%q", restored, originalOwner, restoredOwner, oldMapping, newMapping)
+	}
+	record, err := m.Persistence.GetCodex(ctx, c.CodexId)
+	if err != nil || record.ThreadID != "replacement-thread" || record.LogicalOwnerID != originalOwner {
+		t.Fatalf("record=%+v err=%v", record, err)
+	}
+}
+
+func TestRestoreReplacementGuardRejectsBusyOrNonExactFailures(t *testing.T) {
+	m := &Manager{}
+	c := &remotev1.Codex{ThreadId: "lost", Origin: remotev1.CodexOrigin_CODEX_ORIGIN_REMOTE_CREATED}
+	notFound := &adapter.RPCError{Code: -32004, Message: "thread not found"}
+	notMaterialized := &adapter.RPCError{Code: -32600, Message: "thread lost" + unmaterializedIncludeTurnsSuffix}
+	busyView := &remotev1.CurrentView{Codex: c, ActiveTurn: &remotev1.TurnSnapshot{TurnId: "active"}}
+	busyJSON, err := protojson.Marshal(busyView)
+	if err != nil {
+		t.Fatal(err)
+	}
+	local := proto.Clone(c).(*remotev1.Codex)
+	local.Origin = remotev1.CodexOrigin_CODEX_ORIGIN_LOCAL_EXISTING
+	tests := []struct {
+		name                     string
+		record                   persistence.CodexRecord
+		codex                    *remotev1.Codex
+		err                      error
+		wantReplace, wantRestore bool
+	}{
+		{name: "exact missing thread replaces", codex: c, err: notFound, wantReplace: true},
+		{name: "existing unmaterialized preserves id", codex: c, err: notMaterialized, wantRestore: true},
+		{name: "busy snapshot", record: persistence.CodexRecord{CurrentViewJSON: busyJSON}, codex: c, err: notFound},
+		{name: "local session", codex: local, err: notFound},
+		{name: "non exact error", codex: c, err: &adapter.RPCError{Code: -32004, Message: "different failure"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := m.canReplaceUnmaterializedRemoteCodex(tt.record, tt.codex, tt.err); got != tt.wantReplace {
+				t.Fatalf("replace=%v want=%v", got, tt.wantReplace)
+			}
+			if got := m.canRestoreExistingUnmaterializedRemoteCodex(tt.record, tt.codex, tt.err); got != tt.wantRestore {
+				t.Fatalf("restore=%v want=%v", got, tt.wantRestore)
+			}
+		})
+	}
+}
+
 func TestForgottenMaterializedSessionReimportsWithHistoryAndNewCodexID(t *testing.T) {
 	m := testManager(t)
 	ctx := context.Background()
@@ -1767,6 +1905,9 @@ func TestForgottenMaterializedSessionReimportsWithHistoryAndNewCodexID(t *testin
 	if err := m.saveCodex(ctx, old, "exec"); err != nil {
 		t.Fatal(err)
 	}
+	m.mu.RLock()
+	originalOwner := m.logicalOwners[old.CodexId]
+	m.mu.RUnlock()
 	if _, err := m.ForgetCodex(ctx, &remotev1.ForgetCodexRequest{CodexId: old.CodexId}); err != nil {
 		t.Fatal(err)
 	}
@@ -1779,6 +1920,12 @@ func TestForgottenMaterializedSessionReimportsWithHistoryAndNewCodexID(t *testin
 	}
 	if imported.Codex == nil || imported.Codex.CodexId == old.CodexId || imported.Codex.ThreadId != old.ThreadId {
 		t.Fatalf("imported=%+v", imported)
+	}
+	m.mu.RLock()
+	importedOwner := m.logicalOwners[imported.Codex.CodexId]
+	m.mu.RUnlock()
+	if originalOwner == "" || importedOwner != originalOwner {
+		t.Fatalf("logical owner changed across Forget/re-import: original=%q imported=%q", originalOwner, importedOwner)
 	}
 	history, err := m.ListHistory(ctx, &remotev1.ListHistoryRequest{CodexId: imported.Codex.CodexId})
 	if err != nil || history.History == nil || len(history.History.Turns) != 1 || history.History.Turns[0].TurnId != "old-turn" {

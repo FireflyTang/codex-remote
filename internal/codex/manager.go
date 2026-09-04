@@ -20,6 +20,7 @@ import (
 	remotev1 "github.com/FireflyTang/codex-remote-protocol/gen/go/codex/remote/v1"
 	"github.com/kylin1993/codex-remote/internal/activity"
 	"github.com/kylin1993/codex-remote/internal/adapter"
+	"github.com/kylin1993/codex-remote/internal/attachment"
 	"github.com/kylin1993/codex-remote/internal/capability"
 	"github.com/kylin1993/codex-remote/internal/directory"
 	"github.com/kylin1993/codex-remote/internal/gateway"
@@ -39,6 +40,13 @@ type Runtime interface {
 
 type eventPublisher func(context.Context, *remotev1.Event, *remotev1.CurrentView, *remotev1.Provenance, string) (*remotev1.Event, error)
 
+type AttachmentResolver interface {
+	Upload(context.Context, string, string, string, string, []byte) (attachment.Descriptor, error)
+	Download(context.Context, string, string) (attachment.Descriptor, []byte, error)
+	Resolve(context.Context, string, string) (attachment.Descriptor, string, error)
+	DescribePath(context.Context, string, string) (attachment.Descriptor, error)
+}
+
 type Manager struct {
 	Runtime             Runtime
 	Persistence         *persistence.Store
@@ -55,12 +63,14 @@ type Manager struct {
 	LeaseWarningBefore  time.Duration
 	LeaseSweepInterval  time.Duration
 	Workspaces          *workspacecore.Service
+	Attachments         AttachmentResolver
 	commitMu            sync.Mutex
 	mu                  sync.RWMutex
 	byID                map[string]*remotev1.CurrentView
 	byThread            map[string]string
 	bySession           map[string]string
 	sources             map[string]string
+	logicalOwners       map[string]string
 	manualTitle         map[string]bool
 	warningDeadline     map[string]int64
 	chunks              map[string]uint64
@@ -72,7 +82,7 @@ type Manager struct {
 }
 
 func NewManager(rt Runtime, p *persistence.Store, events *activity.Store, dirs directory.Service, caps *capability.Service, hostID, version string) *Manager {
-	m := &Manager{Runtime: rt, Persistence: p, Events: events, Directories: dirs, Capabilities: caps, HostID: hostID, HostVersion: version, StartedAt: time.Now(), MaxPage: 100, ContentBudget: 256 << 10, byID: make(map[string]*remotev1.CurrentView), byThread: make(map[string]string), bySession: make(map[string]string), sources: make(map[string]string), manualTitle: make(map[string]bool), warningDeadline: make(map[string]int64), chunks: make(map[string]uint64)}
+	m := &Manager{Runtime: rt, Persistence: p, Events: events, Directories: dirs, Capabilities: caps, HostID: hostID, HostVersion: version, StartedAt: time.Now(), MaxPage: 100, ContentBudget: 256 << 10, byID: make(map[string]*remotev1.CurrentView), byThread: make(map[string]string), bySession: make(map[string]string), sources: make(map[string]string), logicalOwners: make(map[string]string), manualTitle: make(map[string]bool), warningDeadline: make(map[string]int64), chunks: make(map[string]uint64)}
 	ws, _ := workspacecore.New(workspacecore.Config{})
 	m.SetWorkspaceService(ws)
 	return m
@@ -133,6 +143,14 @@ func (m *Manager) restoreLocked(ctx context.Context) error {
 		return err
 	}
 	for _, r := range records {
+		if r.LogicalOwnerID == "" {
+			r.LogicalOwnerID, err = m.Persistence.EnsureLogicalOwner(ctx, r.SessionSource, r.ThreadID)
+			if err != nil {
+				return err
+			}
+		} else if err = m.Persistence.BindLogicalOwner(ctx, r.SessionSource, r.ThreadID, r.LogicalOwnerID); err != nil {
+			return err
+		}
 		c := codexFromRecord(r)
 		if c.ManagementState == remotev1.ManagementState_MANAGEMENT_STATE_UNSPECIFIED {
 			c.ManagementState = remotev1.ManagementState_MANAGEMENT_STATE_MANAGED
@@ -145,7 +163,7 @@ func (m *Manager) restoreLocked(ctx context.Context) error {
 			view := &remotev1.CurrentView{Codex: c, GeneratedAtUnixMs: m.now().UnixMilli()}
 			if len(r.CurrentViewJSON) > 0 {
 				persisted := new(remotev1.CurrentView)
-				if protojson.Unmarshal(r.CurrentViewJSON, persisted) == nil {
+				if unmarshalCurrentView(r.CurrentViewJSON, persisted) == nil {
 					view = persisted
 					if view.Codex == nil {
 						view.Codex = c
@@ -166,10 +184,22 @@ func (m *Manager) restoreLocked(ctx context.Context) error {
 		}
 		thread, readErr := ad.ReadThread(ctx, r.ThreadID, true)
 		if readErr != nil {
+			if m.canRestoreExistingUnmaterializedRemoteCodex(r, c, readErr) {
+				if err := m.restoreExistingUnmaterializedRemoteCodex(ctx, r, c); err != nil {
+					return err
+				}
+				continue
+			}
+			if m.canReplaceUnmaterializedRemoteCodex(r, c, readErr) {
+				if err := m.replaceUnmaterializedRemoteCodex(ctx, ad, &r, c); err != nil {
+					return err
+				}
+				continue
+			}
 			persistedAgents := uint32(0)
 			if len(r.CurrentViewJSON) > 0 {
 				persisted := new(remotev1.CurrentView)
-				if protojson.Unmarshal(r.CurrentViewJSON, persisted) == nil && persisted.WorkspaceAccessState != nil {
+				if unmarshalCurrentView(r.CurrentViewJSON, persisted) == nil && persisted.WorkspaceAccessState != nil {
 					persistedAgents = persisted.WorkspaceAccessState.ActiveAgentCount
 				}
 			}
@@ -235,6 +265,86 @@ func (m *Manager) restoreLocked(ctx context.Context) error {
 	return nil
 }
 
+func (m *Manager) canReplaceUnmaterializedRemoteCodex(r persistence.CodexRecord, c *remotev1.Codex, readErr error) bool {
+	return forgottenSessionNotFound(readErr) && m.safeUnmaterializedRemoteCodex(r, c)
+}
+
+func (m *Manager) canRestoreExistingUnmaterializedRemoteCodex(r persistence.CodexRecord, c *remotev1.Codex, readErr error) bool {
+	return m.normalizeUnmaterializedHistory(c, readErr) && m.safeUnmaterializedRemoteCodex(r, c)
+}
+
+func (m *Manager) safeUnmaterializedRemoteCodex(r persistence.CodexRecord, c *remotev1.Codex) bool {
+	if c == nil || c.Origin != remotev1.CodexOrigin_CODEX_ORIGIN_REMOTE_CREATED || r.ActiveTurnID != "" {
+		return false
+	}
+	if len(r.CurrentViewJSON) == 0 {
+		return true
+	}
+	view := new(remotev1.CurrentView)
+	if unmarshalCurrentView(r.CurrentViewJSON, view) != nil {
+		return false
+	}
+	return view.ActiveTurn == nil && len(view.PendingRequests) == 0 && (view.Codex == nil || view.Codex.ActiveTurnId == "")
+}
+
+func (m *Manager) restoreExistingUnmaterializedRemoteCodex(ctx context.Context, r persistence.CodexRecord, c *remotev1.Codex) error {
+	c.Status = remotev1.CodexStatus_CODEX_STATUS_IDLE
+	c.ActiveTurnId = ""
+	r.Status = c.Status.String()
+	r.ActiveTurnID = ""
+	view := &remotev1.CurrentView{Codex: c, GeneratedAtUnixMs: m.now().UnixMilli()}
+	if err := m.ensureWorkspace(r.CodexID, c.Cwd, view); err != nil {
+		return err
+	}
+	m.registerRestored(r, view)
+	return m.persistState(ctx, view)
+}
+
+func (m *Manager) replaceUnmaterializedRemoteCodex(ctx context.Context, ad *adapter.Adapter, r *persistence.CodexRecord, c *remotev1.Codex) error {
+	oldThreadID := r.ThreadID
+	oldSource := normalizeSourceString(r.SessionSource)
+	replacement, err := ad.StartThread(ctx, c.Cwd)
+	if err != nil {
+		return fmt.Errorf("replace unmaterialized thread %s: %w", oldThreadID, err)
+	}
+	if replacement.ID == "" {
+		return fmt.Errorf("replace unmaterialized thread %s: app-server returned an empty thread id", oldThreadID)
+	}
+	newSource := oldSource
+	if len(replacement.Source) != 0 {
+		newSource = normalizeSource(replacement.Source)
+	}
+	if err := m.Persistence.BindLogicalOwner(ctx, newSource, replacement.ID, r.LogicalOwnerID); err != nil {
+		return err
+	}
+	c.ThreadId = replacement.ID
+	if replacement.CWD != "" {
+		c.Cwd = replacement.CWD
+	}
+	c.Status = remotev1.CodexStatus_CODEX_STATUS_IDLE
+	c.ActiveTurnId = ""
+	r.ThreadID = replacement.ID
+	r.SessionSource = newSource
+	r.CWD = c.Cwd
+	r.Status = c.Status.String()
+	r.ActiveTurnID = ""
+	view := &remotev1.CurrentView{Codex: c, GeneratedAtUnixMs: m.now().UnixMilli()}
+	if err := m.ensureWorkspace(r.CodexID, c.Cwd, view); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.ensureMapsLocked()
+	if m.byThread[oldThreadID] == r.CodexID {
+		delete(m.byThread, oldThreadID)
+	}
+	if key := sessionKey(oldSource, oldThreadID); m.bySession[key] == r.CodexID {
+		delete(m.bySession, key)
+	}
+	m.mu.Unlock()
+	m.registerRestored(*r, view)
+	return m.persistState(ctx, view)
+}
+
 func (m *Manager) registerRestored(r persistence.CodexRecord, view *remotev1.CurrentView) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -243,6 +353,7 @@ func (m *Manager) registerRestored(r persistence.CodexRecord, view *remotev1.Cur
 	m.byThread[r.ThreadID] = r.CodexID
 	m.bySession[sessionKey(r.SessionSource, r.ThreadID)] = r.CodexID
 	m.sources[r.CodexID] = normalizeSourceString(r.SessionSource)
+	m.logicalOwners[r.CodexID] = r.LogicalOwnerID
 	m.manualTitle[r.CodexID] = r.ManualTitleOverride
 	m.warningDeadline[r.CodexID] = r.WarningDeadlineUnixMS
 }
@@ -430,7 +541,11 @@ func (m *Manager) CreateCodex(ctx context.Context, req *remotev1.CreateCodexRequ
 	now := m.now()
 	c := &remotev1.Codex{CodexId: newID("cdx"), ThreadId: t.ID, Cwd: t.CWD, Title: title, Origin: remotev1.CodexOrigin_CODEX_ORIGIN_REMOTE_CREATED, Status: remotev1.CodexStatus_CODEX_STATUS_IDLE, ManagementState: remotev1.ManagementState_MANAGEMENT_STATE_MANAGED, ManagedUntilUnixMs: now.Add(m.leaseDuration()).UnixMilli(), CreatedAtUnixMs: now.UnixMilli(), LastActivityAtUnixMs: now.UnixMilli()}
 	source := normalizeSource(t.Source)
-	if err = m.saveCodex(ctx, c, source); err != nil {
+	ownerID, err := m.Persistence.EnsureLogicalOwner(ctx, source, t.ID)
+	if err != nil {
+		return nil, err
+	}
+	if err = m.saveCodex(ctx, c, source, ownerID); err != nil {
 		return nil, err
 	}
 	if err = m.publishCodex(ctx, c, gateway.RequestIDFromContext(ctx)); err != nil {
@@ -511,7 +626,19 @@ func (m *Manager) ImportSession(ctx context.Context, req *remotev1.ImportSession
 		origin = remotev1.CodexOrigin_CODEX_ORIGIN_REMOTE_CREATED
 	}
 	c := &remotev1.Codex{CodexId: newID("cdx"), ThreadId: t.ID, Cwd: t.CWD, Title: title, Origin: origin, Status: remotev1.CodexStatus_CODEX_STATUS_IDLE, ManagementState: remotev1.ManagementState_MANAGEMENT_STATE_MANAGED, ManagedUntilUnixMs: now.Add(m.leaseDuration()).UnixMilli(), CreatedAtUnixMs: unixMillis(t.CreatedAt), ImportedAtUnixMs: now.UnixMilli(), LastActivityAtUnixMs: now.UnixMilli()}
-	if err = m.saveCodex(ctx, c, actualSource); err != nil {
+	ownerID := ""
+	if hasForgotten {
+		ownerID = forgotten.LogicalOwnerID
+	}
+	if ownerID == "" {
+		ownerID, err = m.Persistence.EnsureLogicalOwner(ctx, actualSource, t.ID)
+	} else {
+		err = m.Persistence.BindLogicalOwner(ctx, actualSource, t.ID, ownerID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err = m.saveCodex(ctx, c, actualSource, ownerID); err != nil {
 		return nil, err
 	}
 	if err = m.publishCodex(ctx, c, gateway.RequestIDFromContext(ctx)); err != nil {
@@ -551,7 +678,7 @@ func (m *Manager) ListHistory(ctx context.Context, req *remotev1.ListHistoryRequ
 	}
 	h := &remotev1.HistoryPage{CodexId: req.CodexId, Page: &remotev1.PageInfo{}, HistoryComplete: true}
 	for _, t := range thread.Turns[start:end] {
-		snapshot := m.turnSnapshot(t)
+		snapshot := m.turnSnapshot(t, m.imageResolver(ctx, req.CodexId))
 		h.Turns = append(h.Turns, snapshot)
 		if snapshot.Completeness != nil && (snapshot.Completeness.Truncated || snapshot.Completeness.Incomplete) {
 			h.HistoryComplete = false
@@ -588,11 +715,30 @@ func (m *Manager) StartTurn(ctx context.Context, req *remotev1.StartTurnRequest)
 			}
 		}
 	}
-	var input []adapter.TextInput
+	m.mu.RLock()
+	ownerID := m.logicalOwners[req.CodexId]
+	m.mu.RUnlock()
+	var input []adapter.TurnInput
+	acceptedParts := make([]*remotev1.UserMessagePart, 0, len(req.Input))
 	for _, p := range req.Input {
 		if t := p.GetText(); t != nil {
-			input = append(input, adapter.TextInput{Type: "text", Text: t.Text})
+			input = append(input, adapter.TurnInput{Type: "text", Text: t.Text})
+			acceptedParts = append(acceptedParts, &remotev1.UserMessagePart{Content: &remotev1.UserMessagePart_Text{Text: proto.Clone(t).(*remotev1.TextInput)}})
+			continue
 		}
+		if image := p.GetImage(); image != nil {
+			if m.Attachments == nil {
+				return nil, rpcErr(remotev1.ErrorCode_ERROR_CODE_CAPABILITY_NOT_SUPPORTED, errors.New("image attachments are not enabled"))
+			}
+			descriptor, path, resolveErr := m.Attachments.Resolve(ctx, ownerID, image.AttachmentId)
+			if resolveErr != nil {
+				return nil, attachmentRPCError(resolveErr)
+			}
+			input = append(input, adapter.TurnInput{Type: "localImage", Path: path})
+			acceptedParts = append(acceptedParts, &remotev1.UserMessagePart{Content: &remotev1.UserMessagePart_Image{Image: attachmentDescriptorProto(descriptor)}})
+			continue
+		}
+		return nil, rpcErr(remotev1.ErrorCode_ERROR_CODE_INVALID_REQUEST, errors.New("turn input part is empty"))
 	}
 	opt := adapter.TurnOptions{}
 	if req.Options != nil {
@@ -612,10 +758,92 @@ func (m *Manager) StartTurn(ctx context.Context, req *remotev1.StartTurnRequest)
 	if err := m.setRunning(ctx, req.CodexId, turn.ID, gateway.RequestIDFromContext(ctx)); err != nil {
 		return nil, errors.Join(workspaceErr, err)
 	}
+	if err := m.publishAcceptedUserMessage(ctx, req.CodexId, turn.ID, acceptedParts, gateway.RequestIDFromContext(ctx)); err != nil {
+		return nil, errors.Join(workspaceErr, err)
+	}
 	if workspaceErr != nil {
 		return nil, workspaceErr
 	}
 	return &remotev1.StartTurnResponse{TurnId: turn.ID}, nil
+}
+
+func (m *Manager) publishAcceptedUserMessage(ctx context.Context, codexID, turnID string, parts []*remotev1.UserMessagePart, requestID string) error {
+	m.commitMu.Lock()
+	defer m.commitMu.Unlock()
+	now := m.now().UnixMilli()
+	item := &remotev1.Item{ItemId: turnID + ":user-message", TurnId: turnID, Status: remotev1.ItemStatus_ITEM_STATUS_COMPLETED, Content: &remotev1.Item_UserMessage{UserMessage: &remotev1.UserMessageItem{Parts: parts}}, Provenance: remotev1.ProvenanceKind_PROVENANCE_KIND_LIVE_WIRE}
+	m.boundItem(item, m.contentBudget())
+	m.mu.Lock()
+	view := m.byID[codexID]
+	if view == nil || view.Codex == nil {
+		m.mu.Unlock()
+		return rpcErr(remotev1.ErrorCode_ERROR_CODE_CODEX_NOT_FOUND, errors.New("codex not found"))
+	}
+	snapshot := proto.Clone(view).(*remotev1.CurrentView)
+	ensureActiveTurn(snapshot, turnID)
+	upsertItem(snapshot.ActiveTurn, item)
+	snapshot.ActiveTurn.Completeness = mergeCompleteness(snapshot.ActiveTurn.Completeness, item.Completeness)
+	snapshot.Completeness = mergeCompleteness(snapshot.Completeness, item.Completeness)
+	snapshot.GeneratedAtUnixMs = now
+	m.mu.Unlock()
+	if err := m.persistState(ctx, snapshot); err != nil {
+		m.noteAsyncError(err)
+		return err
+	}
+	m.mu.Lock()
+	m.byID[codexID] = snapshot
+	m.mu.Unlock()
+	event := &remotev1.Event{CodexId: codexID, OccurredAtUnixMs: now, CausedByRequestId: requestID, Event: &remotev1.Event_ItemCompleted{ItemCompleted: &remotev1.ItemCompleted{Item: proto.Clone(item).(*remotev1.Item)}}}
+	m.boundCanonicalEvent(event)
+	if _, err := m.publishEvent(ctx, event, snapshot, &remotev1.Provenance{Kind: remotev1.ProvenanceKind_PROVENANCE_KIND_LIVE_WIRE, ObservedAtUnixMs: now}, ""); err != nil {
+		m.noteAsyncError(err)
+		return err
+	}
+	return nil
+}
+
+func (m *Manager) SetAttachmentService(service AttachmentResolver) {
+	m.Attachments = service
+}
+
+func (m *Manager) UploadImageAttachment(ctx context.Context, req *remotev1.UploadImageAttachmentRequest) (*remotev1.UploadImageAttachmentResponse, error) {
+	if req == nil || req.CodexId == "" {
+		return nil, rpcErr(remotev1.ErrorCode_ERROR_CODE_INVALID_REQUEST, errors.New("codex id is required"))
+	}
+	if _, err := m.lookup(req.CodexId); err != nil {
+		return nil, err
+	}
+	if m.Attachments == nil {
+		return nil, rpcErr(remotev1.ErrorCode_ERROR_CODE_CAPABILITY_NOT_SUPPORTED, errors.New("image attachments are not enabled"))
+	}
+	m.mu.RLock()
+	ownerID := m.logicalOwners[req.CodexId]
+	m.mu.RUnlock()
+	descriptor, err := m.Attachments.Upload(ctx, ownerID, req.Filename, req.MimeType, req.Sha256, req.Content)
+	if err != nil {
+		return nil, attachmentRPCError(err)
+	}
+	return &remotev1.UploadImageAttachmentResponse{Attachment: attachmentDescriptorProto(descriptor)}, nil
+}
+
+func (m *Manager) DownloadImageAttachment(ctx context.Context, req *remotev1.DownloadImageAttachmentRequest) (*remotev1.DownloadImageAttachmentResponse, error) {
+	if req == nil || req.CodexId == "" || req.AttachmentId == "" {
+		return nil, rpcErr(remotev1.ErrorCode_ERROR_CODE_INVALID_REQUEST, errors.New("codex id and attachment id are required"))
+	}
+	if _, err := m.lookup(req.CodexId); err != nil {
+		return nil, err
+	}
+	if m.Attachments == nil {
+		return nil, rpcErr(remotev1.ErrorCode_ERROR_CODE_CAPABILITY_NOT_SUPPORTED, errors.New("image attachments are not enabled"))
+	}
+	m.mu.RLock()
+	ownerID := m.logicalOwners[req.CodexId]
+	m.mu.RUnlock()
+	descriptor, content, err := m.Attachments.Download(ctx, ownerID, req.AttachmentId)
+	if err != nil {
+		return nil, attachmentRPCError(err)
+	}
+	return &remotev1.DownloadImageAttachmentResponse{Attachment: attachmentDescriptorProto(descriptor), Content: content}, nil
 }
 
 func (m *Manager) UnmanageCodex(ctx context.Context, req *remotev1.UnmanageCodexRequest) (*remotev1.UnmanageCodexResponse, error) {
@@ -717,6 +945,7 @@ func (m *Manager) ForgetCodex(ctx context.Context, req *remotev1.ForgetCodexRequ
 	}
 	codex := proto.Clone(view.Codex).(*remotev1.Codex)
 	source := m.sources[req.CodexId]
+	ownerID := m.logicalOwners[req.CodexId]
 	m.mu.RUnlock()
 	if codex.ManagementState != remotev1.ManagementState_MANAGEMENT_STATE_UNMANAGED {
 		return nil, rpcErr(remotev1.ErrorCode_ERROR_CODE_CONFLICT, errors.New("codex must be unmanaged before it can be forgotten"))
@@ -729,7 +958,7 @@ func (m *Manager) ForgetCodex(ctx context.Context, req *remotev1.ForgetCodexRequ
 		}
 	}
 	if err := m.Persistence.UpsertForgottenSession(ctx, persistence.ForgottenSessionRecord{
-		Source: source, SessionID: codex.ThreadId, CWD: codex.Cwd, Title: codex.Title, Origin: codex.Origin.String(),
+		Source: source, SessionID: codex.ThreadId, LogicalOwnerID: ownerID, CWD: codex.Cwd, Title: codex.Title, Origin: codex.Origin.String(),
 		CreatedAtUnixMS: codex.CreatedAtUnixMs, UpdatedAtUnixMS: codex.LastActivityAtUnixMs, Materialized: materialized,
 	}); err != nil {
 		return nil, err
@@ -746,6 +975,7 @@ func (m *Manager) ForgetCodex(ctx context.Context, req *remotev1.ForgetCodexRequ
 		delete(m.bySession, key)
 	}
 	delete(m.sources, req.CodexId)
+	delete(m.logicalOwners, req.CodexId)
 	delete(m.manualTitle, req.CodexId)
 	delete(m.warningDeadline, req.CodexId)
 	for key := range m.chunks {
@@ -1096,11 +1326,23 @@ func (m *Manager) RespondUserInput(ctx context.Context, req *remotev1.RespondUse
 	return &remotev1.RespondUserInputResponse{Request: resolved}, nil
 }
 
-func (m *Manager) saveCodex(ctx context.Context, c *remotev1.Codex, source string) error {
+func (m *Manager) saveCodex(ctx context.Context, c *remotev1.Codex, source string, ownerIDs ...string) error {
 	m.commitMu.Lock()
 	defer m.commitMu.Unlock()
 	source = normalizeSourceString(source)
+	ownerID := ""
+	if len(ownerIDs) != 0 {
+		ownerID = ownerIDs[0]
+	}
+	if ownerID == "" {
+		var err error
+		ownerID, err = m.Persistence.EnsureLogicalOwner(ctx, source, c.ThreadId)
+		if err != nil {
+			return err
+		}
+	}
 	r := recordFromCodex(c, source)
+	r.LogicalOwnerID = ownerID
 	view := &remotev1.CurrentView{Codex: proto.Clone(c).(*remotev1.Codex), GeneratedAtUnixMs: time.Now().UnixMilli()}
 	if err := m.ensureWorkspace(c.CodexId, c.Cwd, view); err != nil {
 		return err
@@ -1120,6 +1362,7 @@ func (m *Manager) saveCodex(ctx context.Context, c *remotev1.Codex, source strin
 	m.byThread[c.ThreadId] = c.CodexId
 	m.bySession[sessionKey(source, c.ThreadId)] = c.CodexId
 	m.sources[c.CodexId] = source
+	m.logicalOwners[c.CodexId] = ownerID
 	m.manualTitle[c.CodexId] = false
 	m.warningDeadline[c.CodexId] = 0
 	m.mu.Unlock()
@@ -1168,6 +1411,48 @@ func (m *Manager) persistView(ctx context.Context, id string, v *remotev1.Curren
 	}
 	return m.Persistence.SetCurrentView(ctx, id, raw)
 }
+
+// unmarshalCurrentView accepts the v1.1 text-only UserMessageItem JSON shape.
+// The wire field changed from input to parts in v1.2 without changing the
+// nested text representation, so this focused rewrite preserves old snapshots
+// without discarding unrelated unknown fields.
+func unmarshalCurrentView(raw []byte, view *remotev1.CurrentView) error {
+	if err := protojson.Unmarshal(raw, view); err == nil {
+		return nil
+	}
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return err
+	}
+	migrateUserMessageInput(value)
+	migrated, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	proto.Reset(view)
+	return protojson.Unmarshal(migrated, view)
+}
+
+func migrateUserMessageInput(value any) {
+	switch value := value.(type) {
+	case []any:
+		for _, entry := range value {
+			migrateUserMessageInput(entry)
+		}
+	case map[string]any:
+		if userMessage, ok := value["userMessage"].(map[string]any); ok {
+			if _, exists := userMessage["parts"]; !exists {
+				if input, legacy := userMessage["input"]; legacy {
+					userMessage["parts"] = input
+					delete(userMessage, "input")
+				}
+			}
+		}
+		for _, child := range value {
+			migrateUserMessageInput(child)
+		}
+	}
+}
 func (m *Manager) persistState(ctx context.Context, v *remotev1.CurrentView) error {
 	if v == nil || v.Codex == nil {
 		return errors.New("current view missing codex")
@@ -1178,10 +1463,12 @@ func (m *Manager) persistState(ctx context.Context, v *remotev1.CurrentView) err
 	}
 	m.mu.RLock()
 	source := m.sources[v.Codex.CodexId]
+	ownerID := m.logicalOwners[v.Codex.CodexId]
 	warningDeadline := m.warningDeadline[v.Codex.CodexId]
 	manualTitleOverride := m.manualTitle[v.Codex.CodexId]
 	m.mu.RUnlock()
 	r := recordFromCodex(v.Codex, source)
+	r.LogicalOwnerID = ownerID
 	r.ManualTitleOverride = manualTitleOverride
 	r.WarningDeadlineUnixMS = warningDeadline
 	r.CurrentViewJSON = raw
@@ -1424,7 +1711,7 @@ func (m *Manager) applyAdapterEventLocked(ctx context.Context, e adapter.Event) 
 		if e.Kind == adapter.EventItemCompleted {
 			status = remotev1.ItemStatus_ITEM_STATUS_COMPLETED
 		}
-		item := m.canonicalItem(e, status)
+		item := m.canonicalItem(e, status, m.imageResolverForOwner(ctx, m.logicalOwners[id]))
 		ensureActiveTurn(view, e.TurnID)
 		upsertItem(view.ActiveTurn, item)
 		view.ActiveTurn.Completeness = mergeCompleteness(view.ActiveTurn.Completeness, item.Completeness)
@@ -1681,9 +1968,57 @@ func pendingCreatedAt(raw json.RawMessage) int64 {
 	}
 	return time.Now().UnixMilli()
 }
-func (m *Manager) canonicalItem(e adapter.Event, status remotev1.ItemStatus) *remotev1.Item {
+func (m *Manager) canonicalItem(e adapter.Event, status remotev1.ItemStatus, imageResolvers ...imageDescriptorResolver) *remotev1.Item {
 	e.ItemID = canonicalEventItemID(e)
-	return translateItem(e.Params, e.TurnID, e.ItemID, e.Method, e.Semantic, status, m.contentBudget(), remotev1.ProvenanceKind_PROVENANCE_KIND_LIVE_WIRE)
+	return translateItem(e.Params, e.TurnID, e.ItemID, e.Method, e.Semantic, status, m.contentBudget(), remotev1.ProvenanceKind_PROVENANCE_KIND_LIVE_WIRE, imageResolvers...)
+}
+
+func (m *Manager) imageResolver(ctx context.Context, codexID string) imageDescriptorResolver {
+	m.mu.RLock()
+	ownerID := m.logicalOwners[codexID]
+	m.mu.RUnlock()
+	return m.imageResolverForOwner(ctx, ownerID)
+}
+
+func (m *Manager) imageResolverForOwner(ctx context.Context, ownerID string) imageDescriptorResolver {
+	return func(path string) (*remotev1.ImageAttachment, error) {
+		if m.Attachments == nil || ownerID == "" {
+			return nil, errors.New("image attachment resolver is unavailable")
+		}
+		descriptor, err := m.Attachments.DescribePath(ctx, ownerID, path)
+		if err != nil {
+			return nil, err
+		}
+		return attachmentDescriptorProto(descriptor), nil
+	}
+}
+
+func attachmentDescriptorProto(d attachment.Descriptor) *remotev1.ImageAttachment {
+	out := &remotev1.ImageAttachment{AttachmentId: d.AttachmentID, Filename: d.Filename, MimeType: d.MIMEType, SizeBytes: d.SizeBytes, Sha256: d.SHA256}
+	if d.WidthPixels != 0 {
+		out.WidthPixels = proto.Uint32(d.WidthPixels)
+	}
+	if d.HeightPixels != 0 {
+		out.HeightPixels = proto.Uint32(d.HeightPixels)
+	}
+	return out
+}
+
+func attachmentRPCError(err error) error {
+	switch {
+	case errors.Is(err, attachment.ErrNotFound):
+		return rpcErr(remotev1.ErrorCode_ERROR_CODE_IMAGE_ATTACHMENT_NOT_FOUND, err)
+	case errors.Is(err, attachment.ErrTooLarge):
+		return rpcErr(remotev1.ErrorCode_ERROR_CODE_IMAGE_ATTACHMENT_TOO_LARGE, err)
+	case errors.Is(err, attachment.ErrMIMEUnsupported):
+		return rpcErr(remotev1.ErrorCode_ERROR_CODE_IMAGE_ATTACHMENT_MIME_TYPE_UNSUPPORTED, err)
+	case errors.Is(err, attachment.ErrContentInvalid):
+		return rpcErr(remotev1.ErrorCode_ERROR_CODE_IMAGE_ATTACHMENT_CONTENT_INVALID, err)
+	case errors.Is(err, attachment.ErrHashMismatch):
+		return rpcErr(remotev1.ErrorCode_ERROR_CODE_IMAGE_ATTACHMENT_HASH_MISMATCH, err)
+	default:
+		return err
+	}
 }
 
 func canonicalEventItemID(e adapter.Event) string {
@@ -1775,7 +2110,7 @@ func (m *Manager) applyItemDelta(turn *remotev1.TurnSnapshot, e adapter.Event, t
 	turn.Items = append(turn.Items, translateItem(raw, turn.TurnId, e.ItemID, e.Method, e.Semantic, remotev1.ItemStatus_ITEM_STATUS_RUNNING, m.contentBudget(), remotev1.ProvenanceKind_PROVENANCE_KIND_LIVE_WIRE))
 	return eventText
 }
-func (m *Manager) turnSnapshot(t adapter.Turn) *remotev1.TurnSnapshot {
+func (m *Manager) turnSnapshot(t adapter.Turn, imageResolvers ...imageDescriptorResolver) *remotev1.TurnSnapshot {
 	out := &remotev1.TurnSnapshot{TurnId: t.ID, Status: turnStatus(t.Status), Provenance: remotev1.ProvenanceKind_PROVENANCE_KIND_IMPORTED_HISTORY}
 	if t.StartedAt != nil {
 		out.StartedAtUnixMs = unixMillis(*t.StartedAt)
@@ -1806,7 +2141,7 @@ func (m *Manager) turnSnapshot(t adapter.Turn) *remotev1.TurnSnapshot {
 		if id == "" {
 			id = fmt.Sprintf("%s-%d", t.ID, i)
 		}
-		item := translateItem(raw, t.ID, id, "imported", adapter.SemanticUnknown, remotev1.ItemStatus_ITEM_STATUS_COMPLETED, m.contentBudget(), remotev1.ProvenanceKind_PROVENANCE_KIND_IMPORTED_HISTORY)
+		item := translateItem(raw, t.ID, id, "imported", adapter.SemanticUnknown, remotev1.ItemStatus_ITEM_STATUS_COMPLETED, m.contentBudget(), remotev1.ProvenanceKind_PROVENANCE_KIND_IMPORTED_HISTORY, imageResolvers...)
 		if item.Completeness != nil {
 			out.Completeness = mergeCompleteness(out.Completeness, item.Completeness)
 		}
@@ -1997,6 +2332,9 @@ func (m *Manager) ensureMapsLocked() {
 	if m.sources == nil {
 		m.sources = make(map[string]string)
 	}
+	if m.logicalOwners == nil {
+		m.logicalOwners = make(map[string]string)
+	}
 	if m.manualTitle == nil {
 		m.manualTitle = make(map[string]bool)
 	}
@@ -2020,7 +2358,7 @@ func (m *Manager) noteUnrecoverablePending(ctx context.Context, codexID string, 
 		return
 	}
 	old := new(remotev1.CurrentView)
-	if protojson.Unmarshal(raw, old) != nil || view == nil || view.Codex == nil {
+	if unmarshalCurrentView(raw, old) != nil || view == nil || view.Codex == nil {
 		return
 	}
 	if old.Codex != nil {
@@ -2163,11 +2501,11 @@ func minimizeItemPresentation(item *remotev1.Item) {
 	item.Completeness = mergeCompleteness(item.Completeness, &remotev1.Completeness{Truncated: true, Incomplete: true, Reason: "frame budget"})
 	switch content := item.Content.(type) {
 	case *remotev1.Item_UserMessage:
-		if len(content.UserMessage.Input) > 1 {
-			content.UserMessage.Input = content.UserMessage.Input[:1]
+		if len(content.UserMessage.Parts) > 1 {
+			content.UserMessage.Parts = content.UserMessage.Parts[:1]
 		}
-		if len(content.UserMessage.Input) > 0 && content.UserMessage.Input[0].GetText() != nil {
-			content.UserMessage.Input[0].GetText().Text = ""
+		if len(content.UserMessage.Parts) > 0 && content.UserMessage.Parts[0].GetText() != nil {
+			content.UserMessage.Parts[0].GetText().Text = ""
 		}
 	case *remotev1.Item_AgentMessage:
 		content.AgentMessage.Text = ""

@@ -35,7 +35,7 @@ func TestTurnSchemaAndCollaborationModeArePreserved(t *testing.T) {
 		_ = encodeWS(c, map[string]any{"id": json.RawMessage(req["id"]), "result": map[string]any{"turn": map[string]any{"id": "turn-1", "status": "failed", "startedAt": 101, "completedAt": 109, "durationMs": 8000, "error": map[string]any{"message": "boom", "additionalDetails": "detail", "codexErrorInfo": map[string]any{"kind": "other"}}, "items": []any{map[string]any{"type": "agentMessage", "id": "item-1", "text": "partial"}}, "itemsView": "summary"}}})
 		c.CloseNow()
 	})
-	turn, err := a.StartTurn(context.Background(), "thread-1", []TextInput{{Type: "text", Text: "go"}}, TurnOptions{Model: "gpt-5.6", CollaborationMode: "plan", ReasoningEffort: "high", ApprovalPolicy: "on-request"})
+	turn, err := a.StartTurn(context.Background(), "thread-1", []TurnInput{{Type: "text", Text: "go"}, {Type: "localImage", Path: "/state/attachments/image"}, {Type: "text", Text: "now"}}, TurnOptions{Model: "gpt-5.6", CollaborationMode: "plan", ReasoningEffort: "high", ApprovalPolicy: "on-request"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,6 +52,13 @@ func TestTurnSchemaAndCollaborationModeArePreserved(t *testing.T) {
 	}
 	if _, ok := params["model"]; ok {
 		t.Fatalf("collaboration mode incorrectly emitted top-level model: %s", req["params"])
+	}
+	var input []map[string]any
+	if err := json.Unmarshal(params["input"], &input); err != nil {
+		t.Fatal(err)
+	}
+	if len(input) != 3 || input[0]["type"] != "text" || input[0]["text"] != "go" || input[1]["type"] != "localImage" || input[1]["path"] != "/state/attachments/image" || input[2]["text"] != "now" {
+		t.Fatalf("mixed input order not preserved: %s", params["input"])
 	}
 	var mode struct {
 		Mode     string `json:"mode"`

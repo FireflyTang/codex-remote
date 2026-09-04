@@ -201,8 +201,22 @@ func (f *fixture) handle(req message, write func(any)) {
 	case "turn/start":
 		var p struct {
 			ThreadID string `json:"threadId"`
+			Input    []any  `json:"input"`
 		}
 		_ = json.Unmarshal(req.Params, &p)
+		if f.scenario == "image-attachments" {
+			items, err := validateImageTurnInput(p.Input)
+			if err != nil {
+				write(map[string]any{"jsonrpc": "2.0", "id": req.ID, "error": map[string]any{"code": -32602, "message": err.Error()}})
+				return
+			}
+			turnID := fmt.Sprintf("turn-%d", time.Now().UnixNano())
+			f.updateTurn(p.ThreadID, turnID, "inProgress")
+			f.replaceTurnItems(p.ThreadID, turnID, items)
+			respond(map[string]any{"turn": map[string]any{"id": turnID, "status": "inProgress", "items": []any{}}})
+			go f.emitTurn(write, p.ThreadID, turnID)
+			return
+		}
 		turnID := fmt.Sprintf("turn-%d", time.Now().UnixNano())
 		f.updateTurn(p.ThreadID, turnID, "inProgress")
 		if f.scenario == "early-large" {
@@ -391,6 +405,54 @@ func (f *fixture) updateTurn(threadID, turnID, status string) {
 	_ = f.persistLocked()
 }
 
+func (f *fixture) replaceTurnItems(threadID, turnID string, items []any) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	thread := f.threads[threadID]
+	turns, _ := thread["turns"].([]any)
+	for _, raw := range turns {
+		turn, _ := raw.(map[string]any)
+		if turn["id"] == turnID {
+			turn["items"] = items
+			_ = f.persistLocked()
+			return
+		}
+	}
+}
+
+func validateImageTurnInput(input []any) ([]any, error) {
+	if len(input) != 3 {
+		return nil, fmt.Errorf("image fixture: input count=%d, want text/image/text", len(input))
+	}
+	first, _ := input[0].(map[string]any)
+	image, _ := input[1].(map[string]any)
+	last, _ := input[2].(map[string]any)
+	if first["type"] != "text" || first["text"] != "before image" {
+		return nil, fmt.Errorf("image fixture: first input=%v", first)
+	}
+	if image["type"] != "localImage" {
+		return nil, fmt.Errorf("image fixture: middle input=%v, want localImage", image)
+	}
+	path, _ := image["path"].(string)
+	if !filepath.IsAbs(path) {
+		return nil, fmt.Errorf("image fixture: localImage path is not absolute: %q", path)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("image fixture: read localImage: %w", err)
+	}
+	if len(raw) < 8 || string(raw[:8]) != "\x89PNG\r\n\x1a\n" {
+		return nil, fmt.Errorf("image fixture: localImage is not PNG")
+	}
+	if last["type"] != "text" || last["text"] != "after image" {
+		return nil, fmt.Errorf("image fixture: last input=%v", last)
+	}
+	return []any{
+		map[string]any{"id": "item-user", "type": "userMessage", "status": "completed", "content": input},
+		map[string]any{"id": "item-agent", "type": "agentMessage", "status": "completed", "text": "deterministic output"},
+	}, nil
+}
+
 func (f *fixture) setAutomaticThreadName(threadID string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -428,7 +490,20 @@ func (f *fixture) persistLocked() error {
 	if f.stateFile == "" {
 		return nil
 	}
-	raw, err := json.Marshal(map[string]any{"threads": f.threads, "next": f.next})
+	persistedThreads := f.threads
+	if f.scenario == "image-attachments" {
+		// Match the real app-server boundary: a newly created thread has no
+		// durable rollout until its first user message. On restart the Host must
+		// replace that missing native thread without changing its logical owner.
+		persistedThreads = make(map[string]map[string]any, len(f.threads))
+		for id, thread := range f.threads {
+			turns, _ := thread["turns"].([]any)
+			if len(turns) > 0 {
+				persistedThreads[id] = thread
+			}
+		}
+	}
+	raw, err := json.Marshal(map[string]any{"threads": persistedThreads, "next": f.next})
 	if err != nil {
 		return err
 	}

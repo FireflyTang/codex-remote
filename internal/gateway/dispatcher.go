@@ -36,6 +36,8 @@ type Backend interface {
 	WriteWorkspaceTextFile(context.Context, *remotev1.WriteWorkspaceTextFileRequest) (*remotev1.WriteWorkspaceTextFileResponse, error)
 	UploadWorkspaceEntry(context.Context, *remotev1.UploadWorkspaceEntryRequest) (*remotev1.UploadWorkspaceEntryResponse, error)
 	DownloadWorkspaceEntry(context.Context, *remotev1.DownloadWorkspaceEntryRequest) (*remotev1.DownloadWorkspaceEntryResponse, error)
+	UploadImageAttachment(context.Context, *remotev1.UploadImageAttachmentRequest) (*remotev1.UploadImageAttachmentResponse, error)
+	DownloadImageAttachment(context.Context, *remotev1.DownloadImageAttachmentRequest) (*remotev1.DownloadImageAttachmentResponse, error)
 }
 
 type DedupStore interface {
@@ -222,6 +224,14 @@ func (d *Dispatcher) call(ctx context.Context, req *remotev1.Request) (*remotev1
 		var v *remotev1.DownloadWorkspaceEntryResponse
 		v, err = d.Backend.DownloadWorkspaceEntry(ctx, x.DownloadWorkspaceEntry)
 		resp.Result = &remotev1.Response_DownloadWorkspaceEntry{DownloadWorkspaceEntry: v}
+	case *remotev1.Request_UploadImageAttachment:
+		var v *remotev1.UploadImageAttachmentResponse
+		v, err = d.Backend.UploadImageAttachment(ctx, x.UploadImageAttachment)
+		resp.Result = &remotev1.Response_UploadImageAttachment{UploadImageAttachment: v}
+	case *remotev1.Request_DownloadImageAttachment:
+		var v *remotev1.DownloadImageAttachmentResponse
+		v, err = d.Backend.DownloadImageAttachment(ctx, x.DownloadImageAttachment)
+		resp.Result = &remotev1.Response_DownloadImageAttachment{DownloadImageAttachment: v}
 	default:
 		return errorResponse(req.RequestId, remotev1.ErrorCode_ERROR_CODE_INVALID_REQUEST, "unsupported request", false), nil
 	}
@@ -287,6 +297,10 @@ func operation(req *remotev1.Request) (string, bool) {
 		return "upload_workspace_entry", true
 	case *remotev1.Request_DownloadWorkspaceEntry:
 		return "download_workspace_entry", false
+	case *remotev1.Request_UploadImageAttachment:
+		return "upload_image_attachment", true
+	case *remotev1.Request_DownloadImageAttachment:
+		return "download_image_attachment", false
 	default:
 		return "unknown", false
 	}
@@ -320,6 +334,8 @@ func markDeduplicated(r *remotev1.Response) {
 		x.RenameCodex.Deduplicated = true
 	case *remotev1.Response_ForgetCodex:
 		x.ForgetCodex.Deduplicated = true
+	case *remotev1.Response_UploadImageAttachment:
+		x.UploadImageAttachment.Deduplicated = true
 	case *remotev1.Response_WriteWorkspaceTextFile:
 		x.WriteWorkspaceTextFile.Deduplicated = true
 	case *remotev1.Response_UploadWorkspaceEntry:

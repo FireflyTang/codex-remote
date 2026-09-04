@@ -42,7 +42,9 @@ func unixMillis(value int64) int64 {
 	return value
 }
 
-func translateItem(raw json.RawMessage, turnID, fallbackID, method string, semantic adapter.EventSemantic, status remotev1.ItemStatus, budget int, provenance remotev1.ProvenanceKind) *remotev1.Item {
+type imageDescriptorResolver func(string) (*remotev1.ImageAttachment, error)
+
+func translateItem(raw json.RawMessage, turnID, fallbackID, method string, semantic adapter.EventSemantic, status remotev1.ItemStatus, budget int, provenance remotev1.ProvenanceKind, imageResolvers ...imageDescriptorResolver) *remotev1.Item {
 	body := rawObject(raw)
 	if item, ok := body["item"].(map[string]any); ok {
 		body = item
@@ -63,10 +65,27 @@ func translateItem(raw json.RawMessage, turnID, fallbackID, method string, seman
 	switch {
 	case typeName == "usermessage" || typeName == "user_message" || strings.Contains(strings.ToLower(method), "usermessage"):
 		msg := &remotev1.UserMessageItem{}
-		for _, text := range inputTexts(body) {
-			bounded, complete := boundString(text, budget)
-			msg.Input = append(msg.Input, &remotev1.UserInputPart{Content: &remotev1.UserInputPart_Text{Text: &remotev1.TextInput{Text: bounded}}})
-			item.Completeness = mergeCompleteness(item.Completeness, complete)
+		var resolve imageDescriptorResolver
+		if len(imageResolvers) != 0 {
+			resolve = imageResolvers[0]
+		}
+		for _, part := range inputParts(body) {
+			switch part.Type {
+			case "text":
+				bounded, complete := boundString(part.Text, budget)
+				msg.Parts = append(msg.Parts, &remotev1.UserMessagePart{Content: &remotev1.UserMessagePart_Text{Text: &remotev1.TextInput{Text: bounded}}})
+				item.Completeness = mergeCompleteness(item.Completeness, complete)
+			case "localImage":
+				if resolve != nil {
+					if descriptor, err := resolve(part.Path); err == nil && descriptor != nil {
+						msg.Parts = append(msg.Parts, &remotev1.UserMessagePart{Content: &remotev1.UserMessagePart_Image{Image: descriptor}})
+					} else {
+						item.Completeness = mergeCompleteness(item.Completeness, &remotev1.Completeness{Incomplete: true, Reason: "local image descriptor is unavailable"})
+					}
+				} else {
+					item.Completeness = mergeCompleteness(item.Completeness, &remotev1.Completeness{Incomplete: true, Reason: "local image descriptor resolver is unavailable"})
+				}
+			}
 		}
 		item.Content = &remotev1.Item_UserMessage{UserMessage: msg}
 	case semantic == adapter.SemanticReasoningText || semantic == adapter.SemanticReasoningSummary || strings.Contains(typeName, "reasoning"):
@@ -199,17 +218,24 @@ func textValue(value any) string {
 	return ""
 }
 
-func inputTexts(body map[string]any) []string {
+type translatedInputPart struct{ Type, Text, Path string }
+
+func inputParts(body map[string]any) []translatedInputPart {
 	for _, key := range []string{"input", "content"} {
 		if raw, ok := body[key]; ok {
-			var out []string
+			var out []translatedInputPart
 			for _, entry := range anySlice(raw) {
 				switch value := entry.(type) {
 				case string:
-					out = append(out, value)
+					out = append(out, translatedInputPart{Type: "text", Text: value})
 				case map[string]any:
-					if text := firstText(value, "text", "content"); text != "" {
-						out = append(out, text)
+					typeName := firstString(value, "type", "kind")
+					if typeName == "localImage" || typeName == "local_image" {
+						if path := firstString(value, "path"); path != "" {
+							out = append(out, translatedInputPart{Type: "localImage", Path: path})
+						}
+					} else if text := firstText(value, "text", "content"); text != "" {
+						out = append(out, translatedInputPart{Type: "text", Text: text})
 					}
 				}
 			}
@@ -219,7 +245,7 @@ func inputTexts(body map[string]any) []string {
 		}
 	}
 	if text := firstText(body, "text", "message"); text != "" {
-		return []string{text}
+		return []translatedInputPart{{Type: "text", Text: text}}
 	}
 	return nil
 }

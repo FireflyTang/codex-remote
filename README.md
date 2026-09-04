@@ -1,6 +1,6 @@
 # Codex Remote
 
-Codex Remote is a Linux Host-only personal demo for controlling local Codex sessions from another device on the same Tailnet. The Host embeds [`tsnet`](https://pkg.go.dev/tailscale.com/tsnet), exposes a plain WebSocket only inside the Tailnet, and implements the Host-supported portion of the V1.1.2 ProtoJSON protocol.
+Codex Remote is a Linux Host-only personal demo for controlling local Codex sessions from another device on the same Tailnet. The Host embeds [`tsnet`](https://pkg.go.dev/tailscale.com/tsnet), exposes a plain WebSocket only inside the Tailnet, and implements the Host-supported portion of the V1.2.0 ProtoJSON protocol.
 
 This repository contains the Host only; a Client is not included. It is functionality-first demo software, not a production security or compliance solution.
 
@@ -35,9 +35,15 @@ The defaults can be changed for development and testing:
 
 ## Workspace access
 
-The Host implements 22 RPCs in V1.1.2, including the six workspace RPCs—GetWorkspace, ListWorkspaceEntries, ReadWorkspaceTextFile, WriteWorkspaceTextFile, UploadWorkspaceEntry, and DownloadWorkspaceEntry. `Capabilities.workspace` advertises five strictly positive hard limits. With the default 4 MiB formal frame they are 512 KiB text files, 2 MiB inline upload, 2 MiB inline download, 32 MiB expanded archives, and 1,000 archive entries; inline/text limits are conservatively reduced when a smaller frame limit is configured.
+The Host implements 24 RPCs in V1.2.0, including the six workspace RPCs—GetWorkspace, ListWorkspaceEntries, ReadWorkspaceTextFile, WriteWorkspaceTextFile, UploadWorkspaceEntry, and DownloadWorkspaceEntry. `Capabilities.workspace` advertises five strictly positive hard limits. With the default 4 MiB formal frame they are 512 KiB text files, 2 MiB inline upload, 2 MiB inline download, 32 MiB expanded archives, and 1,000 archive entries; inline/text limits are conservatively reduced when a smaller frame limit is configured.
 
 Workspace state is exposed consistently through GetWorkspace, Watch RESET snapshots, and WorkspaceAccessStateUpdated. Its persisted monotonic `generation`, `active_agent_count`, and opaque `quiescence_token` gate mutations: writes and uploads are accepted only after the parent agent and every subagent have stopped. Listing, reading, and downloading remain available while agents are active. Only regular files have revisions; Upload is token-gated unconditional create-or-replace, including regular/directory cross-kind replacement, while WriteText remains CAS. Management is independent of workspace access, so an `UNMANAGED` Codex keeps the same workspace operations and state.
+
+## Image attachments
+
+V1.2.0 adds `UploadImageAttachment` and `DownloadImageAttachment`. `Capabilities.image_attachments` advertises PNG, JPEG, and GIF, a default 2 MiB upload limit (further reduced to half the formal frame budget when needed), and a 24-hour minimum unreferenced retention period. This personal Host currently performs no attachment garbage collection and retains uploaded images indefinitely.
+
+`StartTurn` accepts ordered text and image parts and sends images to the native app-server as private Host `localImage` paths. Realtime events and history expose only immutable image descriptors, never those paths. Attachment ownership uses a persistent logical session identity independent of `codex_id`, native thread ID, and CWD, so it survives Host restart, Unmanage, Forget/re-import, and replacement of an unmaterialized native thread.
 
 ## Rename and forget
 
@@ -67,4 +73,4 @@ ws://codex-remote-<linux-hostname>/connect
 
 Both devices must be on the same Tailnet. Traffic is plain WebSocket inside that private network; there is no LAN, public-network, WSS, Serve, or Funnel fallback.
 
-The authoritative language-neutral schema and generated Go artifact are published by [codex-remote-protocol](https://github.com/FireflyTang/codex-remote-protocol). This Host consumes exact `v1.1.2`: both ClientHello and ServerHello use `{major:1, minor:1, patch:2}` with no version fallback. [`protocol.lock`](protocol.lock) records the exact tag, peeled source commit, and descriptor hash. See [development status and known limits](docs/development_status.md#honest-limits-and-deferred-validation) for current boundaries.
+The authoritative language-neutral schema and generated Go artifact are published by [codex-remote-protocol](https://github.com/FireflyTang/codex-remote-protocol). This Host consumes exact `v1.2.0`: both ClientHello and ServerHello use `{major:1, minor:2, patch:0}` with no version fallback. [`protocol.lock`](protocol.lock) records the exact tag, peeled source commit, and descriptor hash. See [development status and known limits](docs/development_status.md#honest-limits-and-deferred-validation) for current boundaries.
